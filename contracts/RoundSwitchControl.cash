@@ -1,0 +1,798 @@
+pragma cashscript ^0.13.1;
+
+// RoundSwitchControlNFT — the system's single master control NFT
+//
+// Commitment layout (30 bytes):
+//   [0]     purpose: 0x03
+//   [1-2]   drawingRound: LE uint16 (the settlement round)
+//   [3-10]  cutoffTime: LE int64 (8 bytes, ticket-sale cutoff time for the settlement round)
+//   [11-15] cumulativeSales: LE uint40 (5 bytes, cumulative tickets sold in this round)
+//   [16-23] lastAggregateTime: LE int64 (8 bytes, last aggregation time; while
+//           aggregateBatchFlag==0x01 this field holds an intermediate running value;
+//           0 = aggregation has not started for this round)
+//   [24-27] stagedRate: LE uint32 (staged exchange rate, not tied to any specific round)
+//   [28]    gameOverFlag: 0x00 = normal operation; 0x01 = game over declared, written by
+//           declareGameOver() and permanent thereafter
+//   [29]    aggregateBatchFlag: 0x00 = aggregation not yet started for this round, or both
+//           batches complete; 0x01 = first batch (32 shards) complete, awaiting the second
+//           batch (64 shards are processed as two batches of 32); see the aggregate() comment
+//
+// ConfigNFT commitment layout (19 bytes, purpose 0x06, none capability):
+//   [0]     purpose: 0x06
+//   [1-8]   GENESIS_TIME: LE int64 (8 bytes, genesis constant, permanent)
+//   [9-12]  PROD_ROUND_PERIOD: LE uint32 (4 bytes, genesis constant, permanent)
+//   [13-14] shardCount: LE uint16 (2 bytes, genesis constant, permanent)
+//   [15-18] settledRate: LE uint32 (4 bytes, this round's actual settled exchange rate;
+//           written by aggregate(), read by enterDrawingPhase(); separate from RSC.stagedRate)
+//
+// ShardSettlementNFT commitment layout (31 bytes):
+//   [0]     purpose: 0x09
+//   [1]     phase: 0x00 (pending settlement) / 0x01 (pending aggregation)
+//   [2-3]   round: LE uint16 (pending settlement = nextSellingRound; pending aggregation = settlementRound)
+//   [4-5]   shardId: LE uint16
+//   [6-9]   nextSellingRate: LE uint32
+//   [10-17] sellingCutoffTime: LE int64 (8 bytes)
+//   [18-21] shardSalesCount: LE uint32
+//   [22-29] lastSoldTime: LE int64 (8 bytes)
+//   [30]    gameOverFlag
+//
+// CanceledRoundNFT commitment layout (12 bytes, purpose 0x07, minting capability):
+//   [0]    purpose: 0x07
+//   [1-2]  round: LE uint16
+//   [3-7]  cumulativeSales: LE uint40 (5 bytes)
+//   [8-11] saleRate: LE uint32
+//
+// GameOverNFT commitment layout (9 bytes, none capability, purpose 0x0B):
+//   [0]   purpose: 0x0B
+//   [1-8] confirmedTime: LE int64 (8 bytes)
+
+contract RoundSwitchControl(
+    bytes32 authNftCategoryId,
+    bytes drawingLockingBytecode,
+    bytes platformPoolLockingBytecode,
+    bytes fixedPrizePoolLockingBytecode,
+    bytes32 adminNftCategoryId,
+    int ticketPriceCents
+) {
+
+    // ─────────────────────────────────────────────────────────────
+    // aggregate: aggregation transaction, collects all 64 ShardSettlementNFTs that are
+    // pending aggregation.
+    //
+    // Transaction structure (Input[0] / Output[0] = this contract, each batch is a fixed 32 shards):
+    //   Input[0]    = RoundSwitchControlNFT
+    //   Input[1..32] = ShardSettlementNFT x 32 (this batch, pending-aggregation state)
+    //   Input[33]   = ConfigNFT (read-only reference to GENESIS_TIME/PROD_ROUND_PERIOD;
+    //                 destroyed and recreated, unlocked via useConfigForAggregate())
+    //   Input[34]   = optional escape-hatch plain BCH (only needed when Input[0..33]'s
+    //                 allocation + execution reward isn't enough to cover the fee; must not
+    //                 carry any token)
+    //
+    //   Output[0]    = RoundSwitchControlNFT: cumulativeSales for this round is incremented by
+    //                  this batch's 32-shard contribution; BCH value is incremented by the
+    //                  amount transferred in from this batch's 32 shards, minus this batch's
+    //                  allocation for the next settlement reward, this transaction's own fee
+    //                  reserve, and this transaction's own execution reward
+    //   Output[1..32] = ShardSettlementNFT x 32: BCH value = dust + settle() fee reserve
+    //                  + allocation for the next settle() execution reward
+    //   Output[33]   = ConfigNFT (destroyed and recreated back to the contract, validated by
+    //                  useConfigForAggregate())
+    //   Output[34]   = execution reward -> any address chosen by the transaction builder
+    //                  (the contract does not validate the destination); only the dust floor
+    //                  is checked
+    // ─────────────────────────────────────────────────────────────
+    function aggregate() {
+        require(this.activeInputIndex == 0, "RSC contract must always be at input index 0");
+
+        // Each batch always handles 32 shards: 1(RSC) + 32(SS) + 1(Config) + 1(execution reward) = 35 outputs
+        require(tx.outputs.length == 35, "aggregate must process exactly 32 shards per batch");
+        // Input[34] (escape hatch) is optional; when present, it must be plain BCH with no token
+        require(tx.inputs.length == 34 || tx.inputs.length == 35, "Invalid number of inputs");
+        if (tx.inputs.length == 35) {
+            require(tx.inputs[34].tokenCategory == 0x, "Input[34] must be plain BCH, not an NFT");
+        }
+
+        // Parse the RSC commitment (30 bytes)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 30);
+
+        bytes1 rscPurposeB,         bytes rscR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 rscRoundB,           bytes rscR2 = rscR1.split(2);
+        bytes8 rscCutoffTimeB,      bytes rscR3 = rscR2.split(8);
+        bytes5 rscCumulativeSalesB, bytes rscR4 = rscR3.split(5);
+        // Old lastAggregateTime: 0 on the first batch, or the first batch's running value on the second batch
+        bytes8 rscOldLastAggTimeB, bytes rscR5 = rscR4.split(8);
+        bytes4 rscStagedRateB,     bytes rscR6 = rscR5.split(4);
+        bytes1 rscGameOverFlagB,   bytes rscBatchFlagB = rscR6.split(1);
+
+        require(rscPurposeB == 0x03);
+
+        // First batch requires the old flag to be 0x00 (not yet aggregated this round); second
+        // batch requires the old flag to be 0x01 (first batch already complete)
+        require(rscBatchFlagB == 0x00 || rscBatchFlagB == 0x01, "Invalid aggregateBatchFlag");
+        bool isSecondBatch = rscBatchFlagB == 0x01;
+
+        // Parse the ConfigNFT commitment (19 bytes, Input[33] = 1 RSC + 32 shard) for GENESIS_TIME;
+        // settledRate is not needed here
+        require(tx.inputs[33].tokenCategory == authNftCategoryId);
+        require(tx.inputs[33].nftCommitment.split(1)[0] == 0x06);
+        require(tx.inputs[33].nftCommitment.length == 19);
+
+        bytes1 cfgPurposeB,     bytes cfgR1 = tx.inputs[33].nftCommitment.split(1);
+        bytes8 cfgGenesisTimeB = cfgR1.split(8)[0];
+
+        require(cfgPurposeB == 0x06);
+
+        int totalSettledSales = 0;
+        int totalSettledBch = 0;
+        // Floor: the larger of GENESIS_TIME and the old lastAggregateTime
+        int maxLastSoldTime = max(int(cfgGenesisTimeB), int(rscOldLastAggTimeB));
+
+        // Accumulation only: purpose/phase/round validation and Output[i] reconstruction checks
+        // are handled in RoundShardAuth.useForAggregate()
+        for (int i = 1; i <= 32; i++) {
+            require(tx.inputs[i].tokenCategory == authNftCategoryId + 0x02);
+            require(tx.inputs[i].nftCommitment.length == 31);
+            require(tx.inputs[i].nftCommitment.split(1)[0] == 0x09);
+
+            bytes ssTail = tx.inputs[i].nftCommitment.split(18)[1];
+            bytes4 ssSalesCountB, bytes ssLastSoldTimeRawB = ssTail.split(4);
+
+            totalSettledSales = totalSettledSales + int(ssSalesCountB);
+            totalSettledBch = totalSettledBch + tx.inputs[i].value;
+            maxLastSoldTime = max(maxLastSoldTime, int(unsafe_bytes8(ssLastSoldTimeRawB)));
+        }
+
+        // Fee and execution reward required by settle():
+        int settleFeeReserve = 6000;
+        int aggregateFeeReserve = 90000;
+
+        int rscStagedRateI = int(rscStagedRateB);
+        require(rscStagedRateI > 0);
+        int oneUsdSats = 10_000_000_000 / rscStagedRateI;
+        int perShardSettle = (oneUsdSats - (oneUsdSats % 64)) / 64;
+        // This batch only allocates for these 32 shards (the other 32 are allocated by the other aggregate() call)
+        int settlePoolTotal = (settleFeeReserve + perShardSettle) * 32;
+
+        // This transaction's own execution reward, fixed at 0.5 USD per batch
+        int roundRevenueSats = totalSettledBch - 1000 * 32;
+        int ownReward = oneUsdSats / 2;
+
+        // Output[0]: RoundSwitchControlNFT update — cumulativeSales incremented by this batch's contribution
+        bytes5 newCumulativeSalesB = toPaddedBytes(int(rscCumulativeSalesB) + totalSettledSales, 5);
+        bytes8 newLastAggregateTimeB = toPaddedBytes(maxLastSoldTime, 8);
+        bytes1 newBatchFlagB = 0x01;
+        if (isSecondBatch) {
+            newBatchFlagB = 0x00;
+        }
+        bytes newRscC = rscPurposeB + rscRoundB + rscCutoffTimeB + newCumulativeSalesB + newLastAggregateTimeB + rscStagedRateB + rscGameOverFlagB + newBatchFlagB;
+
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode, "Invalid RSC NFT locking bytecode");
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory, "Invalid RSC NFT token category");
+
+        // Also deduct aggregateFeeReserve (this transaction's fee) + 1000 (Output[34]'s dust)
+        int newRscValue = tx.inputs[0].value + roundRevenueSats - settlePoolTotal - ownReward - aggregateFeeReserve - 1000;
+        if (newRscValue < 1000) {
+            newRscValue = 1000;
+        }
+        require(tx.outputs[0].value == newRscValue, "Invalid RSC NFT value");
+        require(tx.outputs[0].nftCommitment == newRscC, "Invalid RSC NFT commitment");
+
+        // Output[33]: ConfigNFT (destroyed and recreated back to the contract, fully validated by useConfigForAggregate())
+
+        // Output[34]: execution reward -> any address chosen by the transaction builder
+        // (destination not validated); only the dust floor is checked
+        require(tx.outputs[34].tokenCategory == 0x, "Invalid reward output - should not hold any tokens");
+        require(tx.outputs[34].value >= 1000 + ownReward, "Invalid reward output value");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useConfigForAggregate: unlocks Input[33]'s ConfigNFT within the aggregation transaction
+    // (1 RSC + 32 shard, see the batch-aggregation comment on aggregate())
+    //
+    // Rewrites ConfigNFT's settledRate to Input[1]'s ShardSettlementNFT rate; the genesis
+    // constants GENESIS_TIME/PROD_ROUND_PERIOD/shardCount stay unchanged.
+    //
+    // Transaction structure: same as the comment above aggregate()
+    // ─────────────────────────────────────────────────────────────
+    function useConfigForAggregate() {
+        require(this.activeInputIndex == 33, "ConfigNFT contract must always be at input index 33");
+
+        require(tx.inputs[33].tokenCategory == authNftCategoryId);
+        require(tx.inputs[33].nftCommitment.length == 19);
+        require(tx.inputs[33].nftCommitment.slice(0, 1) == 0x06);
+
+        // Validate Input[0]/Input[1] as this round's RSC and pending-aggregate SS
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 30);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x03);
+        bytes2 rscRoundB = tx.inputs[0].nftCommitment.slice(1, 3);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 31);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x09, "Input[1] must be a ShardSettlementNFT");
+        require(tx.inputs[1].nftCommitment.slice(1, 2) == 0x01, "Input[1] SS must be in pending-aggregate phase");
+        require(tx.inputs[1].nftCommitment.slice(2, 4) == rscRoundB, "Input[1] SS round must match this round's RSC");
+
+        bytes4 settledRateB = tx.inputs[1].nftCommitment.slice(6, 10);
+
+        // Output[33]: ConfigNFT — genesis constants (first 15 bytes) unchanged; settledRate
+        // updated to the value read from Input[1]
+        require(tx.outputs[33].lockingBytecode == tx.inputs[33].lockingBytecode);
+        require(tx.outputs[33].tokenCategory == tx.inputs[33].tokenCategory);
+        require(tx.outputs[33].nftCommitment == tx.inputs[33].nftCommitment.slice(0, 15) + settledRateB);
+        require(tx.outputs[33].value == 1000);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // enterDrawingPhase: after aggregation completes, distributes funds and creates the DrawingNFT
+    //
+    // Transaction structure (Input[1] / Output[3] = this contract):
+    //   Input[0] = JackpotPoolNFT (minting, purpose 0x0A)
+    //   Input[1] = RSC NFT (minting, holds all the BCH)
+    //   Input[2] = ConfigNFT (none, purpose 0x06)
+    //   Input[3+] = plain BCH (required, used to pay fees and collect the execution reward)
+    //
+    //   Output[0] = FixedPrizePool (plain BCH, no NFT, = this round's gross ticket revenue × 30%)
+    //   Output[1] = PlatformPool (plain BCH, no NFT, = RSC's remaining balance after JP/FPP/costs)
+    //   Output[2] = JackpotPoolNFT (commitment updates totalBCH, BCH += gross ticket revenue × 50%)
+    //   Output[3] = RSC NFT (settlement round + 1, cutoffTime recomputed, cumulativeSales=0, lastAggregateTime reset to zero)
+    //   Output[4] = Drawing NFT (newly minted, minting, purpose 0x04, value = dust + a fixed 3 USD reserve)
+    //   Output[5] = execution reward address (plain BCH, fixed 1 USD)
+    //   Output[6] = ConfigNFT (identical to the input)
+    //   Output[7] = change BCH
+    //
+    //   Trigger threshold: Input[1]'s lastAggregateTime must be non-zero (aggregation complete)
+    // ─────────────────────────────────────────────────────────────
+    function enterDrawingPhase() {
+        require(this.activeInputIndex == 1, "RSC contract must always be at input index 1");
+
+        // Parse the RSC commitment (30 bytes, extract every field in order)
+        bytes1 rscPurposeB,         bytes rscR1 = tx.inputs[1].nftCommitment.split(1);
+        bytes2 rscRoundB,           bytes rscR2 = rscR1.split(2);
+        // Skip cutoffTime (recomputed below from ConfigNFT)
+        bytes rscR3 = rscR2.split(8)[1];
+        bytes5 rscCumulativeSalesB, bytes rscR4 = rscR3.split(5);
+        bytes8 rscLastAggregateTimeB, bytes rscR5 = rscR4.split(8);
+        bytes4 rscStagedRateB, bytes rscR6 = rscR5.split(4);
+        bytes1 rscGameOverFlagB, bytes rscBatchFlagB = rscR6.split(1);
+
+        // Validate input[0] as JackpotPoolNFT (minting, purpose 0x0A)
+        bytes1 jpPurposeB,  bytes jpR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes10 jpOrignalB, bytes jpR2 = jpR1.split(10);
+        bytes jpLastClaimTimeB = jpR2.split(8)[1];
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Validate input[1] as this contract's RSC NFT (minting, purpose 0x03)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(rscPurposeB == 0x03);
+        require(tx.inputs[1].nftCommitment.length == 30);
+
+        // Trigger threshold: lastAggregateTime non-zero and aggregateBatchFlag reset to zero (aggregation complete)
+        require(rscLastAggregateTimeB != 0x0000000000000000, "aggregate() must complete before entering drawing phase");
+        require(rscBatchFlagB == 0x00, "aggregate() second batch must complete before entering drawing phase");
+
+        // Parse the ConfigNFT commitment (19 bytes, purpose 0x06, none capability, no category suffix)
+        bytes1 cfgPurposeB,       bytes cfgR1 = tx.inputs[2].nftCommitment.split(1);
+        bytes8 cfgGenesisTimeB,   bytes cfgR2 = cfgR1.split(8);
+        bytes4 cfgRoundPeriodB,   bytes cfgR3 = cfgR2.split(4);
+        // Skip shardCount (2 bytes); take settledRate (4 bytes, written by aggregate())
+        bytes4 cfgSettledRateB = unsafe_bytes4(cfgR3.split(2)[1]);
+
+        require(tx.inputs[2].tokenCategory == authNftCategoryId);
+        require(cfgPurposeB == 0x06);
+        require(tx.inputs[2].nftCommitment.length == 19);
+
+        // rscStagedRateB is scaled up 100x (ATTESTATION_SCALING); unscale it to get the sats equivalent of 1 USD
+        int executeShare = 10_000_000_000 / int(rscStagedRateB);
+
+        // Reserve for the next round's two aggregate() batches' execution reward (0.5 USD each, 1 USD total)
+        int aggregateReserve = executeShare;
+        // Reserve for the next round's 64-shard settle() execution reward (formula matches RoundShardAuth.useForAggregate())
+        int settleFeeReserve = 6000;
+        int perShardSettle = (executeShare - (executeShare % 64)) / 64;
+        int settleRefillReserve = (settleFeeReserve + perShardSettle) * 64;
+
+        // New RSC commitment (round+1, cutoffTime recomputed, cumulativeSales=0, lastAggregateTime=0, aggregateBatchFlag=0)
+        bytes2 newRscRoundB   = toPaddedBytes(int(rscRoundB) + 1, 2);
+        bytes8 newCutoffTimeB = toPaddedBytes(int(cfgGenesisTimeB) + int(newRscRoundB) * int(cfgRoundPeriodB), 8);
+        bytes30 newRscC = rscPurposeB + newRscRoundB + newCutoffTimeB + 0x0000000000 + 0x0000000000000000 + rscStagedRateB + rscGameOverFlagB + 0x00;
+
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[3].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[3].value == 1000 + aggregateReserve + settleRefillReserve);
+        require(tx.outputs[3].nftCommitment == newRscC);
+
+        // Compute the fund distribution: JP (50%) and FPP (30%) of gross ticket revenue
+        // (ticketPriceSats × cumulativeSales); PlatformPool absorbs the remaining balance
+        int cfgSettledRateI = int(cfgSettledRateB);
+        require(cfgSettledRateI > 0);
+        int ticketPriceSats = ticketPriceCents * 100_000_000 / cfgSettledRateI;
+        int grossRevenue = ticketPriceSats * int(rscCumulativeSalesB);
+
+        int jackpotShare = grossRevenue * 50 / 100;
+        int fixedShare   = grossRevenue * 30 / 100;
+
+        // Enforce the dust floor on every output
+        if (fixedShare < 1000) {
+            fixedShare = 1000;
+        }
+        if (jackpotShare < 1000) {
+            jackpotShare = 1000;
+        }
+
+        int totalBCH = tx.inputs[1].value - 1000; // deduct RSC NFT's dust
+
+        int reserve = executeShare * 3; // reward reserve: 1 USD each for draw and verifyWin plus a 1 USD buffer, held in DrawingNFT
+        // PlatformPool absorbs: JP/FPP's floor amounts, this transaction's execution reward,
+        // the next round's aggregate()/settle() reserves, and DrawingNFT's dust
+        int platformShare = totalBCH - jackpotShare - fixedShare - executeShare - reserve - aggregateReserve - settleRefillReserve - 1000;
+        if (platformShare < 1000) {
+            platformShare = 1000;
+        }
+
+        // Output[0]: FixedPrizePool (plain BCH, no NFT)
+        require(tx.outputs[0].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[0].tokenCategory == 0x);
+        require(tx.outputs[0].value == fixedShare);
+
+        // Output[1]: PlatformPool (plain BCH, no NFT)
+        require(tx.outputs[1].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs[1].value == platformShare);
+
+        // Output[2]: JackpotPoolNFT (commitment updates the JP's current prize total, BCH += 50%)
+        int newJackpot = tx.inputs[0].value + jackpotShare;
+        bytes8 newJackpotB = toPaddedBytes(newJackpot, 8);
+        bytes27 newJpC = jpPurposeB + jpOrignalB + newJackpotB + unsafe_bytes8(jpLastClaimTimeB);
+
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[2].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[2].value == newJackpot);
+        require(tx.outputs[2].nftCommitment == newJpC);
+
+        // Output[4]: DrawingNFT (purpose 0x04, value = dust + a fixed 3 USD reserve)
+        // expectedDrawTime = lastAggregateTime + 10800 (3 hours)
+        bytes8 expectedDrawTimeB = toPaddedBytes(int(rscLastAggregateTimeB) + 10800, 8);
+        bytes drawingNftC = 0x04 + rscRoundB + expectedDrawTimeB + rscCumulativeSalesB;
+
+        require(tx.outputs[4].lockingBytecode == drawingLockingBytecode);
+        require(tx.outputs[4].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[4].value == 1000 + reserve);
+        require(tx.outputs[4].nftCommitment == drawingNftC);
+
+        // Output[5]: execution reward address (plain BCH, fixed 1 USD)
+        require(tx.outputs[5].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[5].value == executeShare);
+        require(tx.outputs[5].tokenCategory == 0x);
+
+        // Output[6]: ConfigNFT (destroyed and recreated back to the contract, commitment unchanged, see useConfig())
+        require(tx.outputs[6].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[6].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[6].value == 1000);
+        require(tx.outputs[6].nftCommitment == tx.inputs[2].nftCommitment);
+
+        // Output[7]: change BCH
+        require(tx.outputs[7].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[7].value >= 1000);
+        require(tx.outputs[7].tokenCategory == 0x);
+
+        require(tx.outputs.length == 8, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useConfig: unlocked within the enterDrawingPhase() transaction, used to compute the new cutoffTime
+    //
+    // Transaction structure: same as the comment above enterDrawingPhase()
+    // ─────────────────────────────────────────────────────────────
+    function useConfig() {
+        require(this.activeInputIndex == 2, "ConfigNFT contract must always be at input index 2");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Validate input[1] as RSC NFT (minting, purpose 0x03)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[1].nftCommitment.length == 30);
+
+        require(tx.inputs[2].tokenCategory == authNftCategoryId);
+        require(tx.inputs[2].nftCommitment.split(1)[0] == 0x06);
+        require(tx.inputs[2].nftCommitment.length == 19);
+
+        // Output[0]: FixedPrizePool (amount validated by RSC.enterDrawingPhase; here we only check the destination and basic fields)
+        require(tx.outputs[0].tokenCategory == 0x);
+        require(tx.outputs[0].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[0].value >= 1000);
+
+        // Output[1]: PlatformPool (amount validated by RSC.enterDrawingPhase; here we only check the destination and basic fields)
+        require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs[1].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[1].value >= 1000);
+
+        // Output[2]: this contract's JackpotPoolNFT (the actual totalBCH computation is validated by RSC.enterDrawingPhase; here we only check basic fields)
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[2].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[2].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.outputs[2].nftCommitment.length == 27);
+        require(tx.outputs[2].value >= tx.inputs[0].value);
+
+        // Output[3]: RSC NFT (the actual content is validated by RSC.enterDrawingPhase; here we only check basic fields)
+        require(tx.outputs[3].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[3].nftCommitment.split(1)[0] == 0x03);
+        require(tx.outputs[3].nftCommitment.length == 30);
+        require(tx.outputs[3].value >= 1000);
+
+        // Output[4]: DrawingNFT (newly minted; the actual content is validated by RSC.enterDrawingPhase; here we only check the NFT type and basic fields)
+        require(tx.outputs[4].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[4].nftCommitment.split(1)[0] == 0x04);
+        require(tx.outputs[4].nftCommitment.length == 16);
+        require(tx.outputs[4].value >= 1000);
+
+        // Output[5]: execution reward address (plain BCH; amount validated by RSC.enterDrawingPhase; here we only check the destination and basic fields)
+        require(tx.outputs[5].tokenCategory == 0x);
+        require(tx.outputs[5].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[5].value >= 1000);
+
+        // Output[6]: ConfigNFT (completely identical; also enforces that GENESIS_TIME/PROD_ROUND_PERIOD cannot change)
+        require(tx.outputs[6].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[6].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[6].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[6].value == tx.inputs[2].value);
+
+        // Output[7]: change BCH (kept separate from the execution reward)
+        require(tx.outputs[7].tokenCategory == 0x);
+        require(tx.outputs[7].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[7].value >= 1000);
+
+        require(tx.outputs.length == 8, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // draw: updates the staged exchange rate after the draw
+    // Primary validation happens in Drawing.cash; this contract only does basic validation.
+    //
+    // Transaction structure (Input[1] / Output[2] = this contract):
+    //   Input[0] = DrawingNFT (minting, purpose 0x04; Drawing.cash validates the oracle and computes the numbers)
+    //   Input[1] = RSC NFT (minting, purpose 0x03)
+    //   Input[2+] = plain BCH (required, used to pay fees and collect the execution reward)
+    //
+    //   Output[0] = WinningNumberNFT (to the FixedPrizePool contract, minting, purpose 0x05)
+    //   Output[1] = WinningNumberNFT (to the JackpotPool contract, immutable, purpose 0x05, value = dust + remaining platform share)
+    //   Output[2] = RSC NFT (only the staged exchange rate is updated; BCH passed through unchanged, no longer holds the platform share)
+    //   Output[3] = execution reward address (plain BCH, fixed 1 USD, funded from the platform share carried by DrawingNFT)
+    //   Output[4] = change BCH (kept separate from the execution reward)
+    //   The execution reward always pays a fixed 1 USD equivalent and is never zeroed out for low
+    //   ticket volume; if funds fall short, the executor must top it up themselves.
+    //
+    // ─────────────────────────────────────────────────────────────
+    function draw() {
+        // Validate input[0] as DrawingNFT (minting, purpose 0x04)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x04);
+        require(tx.inputs[0].nftCommitment.length == 16);
+
+        // Validate input[1] as this contract's RSC NFT
+        require(this.activeInputIndex == 1, "RSC contract must always be at input index 1");
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[1].nftCommitment.length == 30);
+
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[0].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[0].nftCommitment.length == 16);
+        require(tx.outputs[0].nftCommitment.split(1)[0] == 0x05);
+        require(tx.outputs[0].value == 1000);
+
+        require(tx.outputs[1].tokenCategory == authNftCategoryId);
+        require(tx.outputs[1].nftCommitment.length == 16);
+        require(tx.outputs[1].nftCommitment.split(1)[0] == 0x05);
+        require(tx.outputs[1].value >= 1000);
+
+        require(tx.outputs[2].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[2].nftCommitment.split(1)[0] == 0x03);
+        require(tx.outputs[2].nftCommitment.length == 30);
+        require(tx.outputs[2].value >= 1000);
+
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[3].value >= 1000);
+
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[4].value >= 1000);
+
+        require(tx.outputs.length == 5, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // verifyWin: validates the prize-verification transaction (called regardless of whether
+    // there's a winner)
+    // Primary validation lives in JackpotPool.cash; this only does basic validation.
+    //
+    // Transaction structure (Input[3] / Output[2] = this contract):
+    //   Input[0] = JackpotPoolNFT (JP contract, minting, calls verifyWin())
+    //   Input[1] = WinningNumberNFT
+    //   Input[2] = NumberSalesNFT
+    //   Input[3] = RoundSwitchControlNFT
+    //   Input[4+] = plain BCH (required, used to pay fees and collect the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT, old pool
+    //   Output[1] = NumberSalesNFT (passed through unchanged)
+    //   Output[2] = RoundSwitchControlNFT (passed through unchanged)
+    //   Output[3] = execution reward address (plain BCH, fixed 1 USD, funded from WinningNumberNFT)
+    //   Output[4] = PlatformPool (plain BCH, the balance after the reward is deducted)
+    //   Output[5] = JackpotPoolNFT, new pool (only minted when there is a winner)
+    //   Output[5 or 6] = change BCH (separate from the execution reward; shifted depending on
+    //   whether a new pool was minted)
+    //   The execution reward is fixed at 1 USD equivalent and never drops to zero for low ticket
+    //   volume; if funds are insufficient the executor must top up the shortfall.
+    //
+    // ─────────────────────────────────────────────────────────────
+    function verifyWin() {
+        require(this.activeInputIndex == 3, "RoundSwitchControlNFT contract must always be at input index 3");
+
+        // Validate input[0] as JP NFT (minting, purpose 0x0A)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Validate input[1] as WN NFT (immutable, purpose 0x05)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x05);
+        require(tx.inputs[1].nftCommitment.length == 16);
+
+        // Validate input[2] as this contract's NS NFT (mutable, purpose 0x02)
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x01);
+        require(tx.inputs[2].nftCommitment.split(1)[0] == 0x02);
+        require(tx.inputs[2].nftCommitment.length == 17);
+
+        // Validate input[3] as RSC NFT (minting, purpose 0x03)
+        require(tx.inputs[3].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[3].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[3].nftCommitment.length == 30);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.outputs[0].nftCommitment.length == 27);
+        require(tx.outputs[0].value >= 1000);
+
+        require(tx.outputs[1].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[1].nftCommitment.split(1)[0] == 0x02);
+        require(tx.outputs[1].nftCommitment.length == 17);
+        require(tx.outputs[1].value >= 1000);
+
+        require(tx.outputs[2].tokenCategory == tx.inputs[3].tokenCategory);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[2].nftCommitment.split(1)[0] == 0x03);
+        require(tx.outputs[2].nftCommitment.length == 30);
+        require(tx.outputs[2].value >= 1000);
+
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[4].lockingBytecode);
+        require(tx.outputs[3].value >= 1000);
+
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[4].value >= 1000);
+
+        // Output[5] (new jackpot pool) only exists when there's a winner, immediately followed
+        // by the change output, so total output count is 6 or 7
+        // tx.outputs.length == 6: no winner
+        if (tx.outputs.length == 6) {
+            // Output[5] = change BCH
+            require(tx.outputs[5].tokenCategory == 0x);
+            require(tx.outputs[5].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[5].value >= 1000);
+
+            require(tx.outputs.length == 6, "Invalid number of outputs");
+        } else {
+            // Output[5] = new jackpot pool
+            require(tx.outputs[5].tokenCategory == authNftCategoryId + 0x02);
+            require(tx.outputs[5].nftCommitment.split(1)[0] == 0x0a);
+            require(tx.outputs[5].nftCommitment.length == 27);
+            require(tx.outputs[5].value >= 1000);
+
+            // Output[6] = change BCH
+            require(tx.outputs[6].tokenCategory == 0x);
+            require(tx.outputs[6].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[6].value >= 1000);
+            require(tx.outputs.length == 7, "Invalid number of outputs");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // cancelDraw: 開獎逾期取消交易中，供本合約 RSC NFT 自己的 input 呼叫解鎖
+    // 主要驗證在 Drawing.cash，這裡只驗證本合約 RSC NFT 原樣送回
+    //
+    // 交易結構（Input[1] / Output[2] = 本合約）：
+    //   Input[0] = DrawingNFT（minting，purpose 0x04，銷毀，由 Drawing.cancelDraw() 驗證觸發條件）
+    //   Input[1] = RoundSwitchControlNFT（minting，purpose 0x03，唯讀，由 RSC.cancelDraw() 驗證）
+    //   Input[2] = JackpotPoolNFT（minting，purpose 0x0A，累積中，本合約）
+    //   Input[3+] = 觸發者 plain BCH（必填，用於支付手續費及收執行獎勵使用）
+    //
+    //   Output[0] = 固定獎池地址（plain BCH，無 NFT，實際金額由 Drawing.cancelDraw() 完整驗證）
+    //   Output[1] = CanceledRoundNFT（新鑄造，由 Drawing.cancelDraw() 驗證）
+    //   Output[2] = RSC NFT（原樣送回，由 RSC.cancelDraw() 驗證）
+    //   Output[3] = JackpotPoolNFT（回原合約，BCH -= jpRefund，「中獎時的頭獎總額」同步更新，其餘欄位不變）
+    //   Output[4] = 執行獎勵地址（plain BCH，由 Drawing.cancelDraw() 驗證）
+    //   Output[5] = 找零 BCH（由 Drawing.cancelDraw() 驗證）
+    //
+    //   Output[2] = RSC NFT（原樣送回合約，commitment／value 皆不變）
+    // ─────────────────────────────────────────────────────────────
+    function cancelDraw() {
+        require(this.activeInputIndex == 1, "RSC contract must always be at input index 1");
+
+        // 驗證 input[0] 為 DrawingNFT（minting，purpose 0x04）
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x04);
+        require(tx.inputs[0].nftCommitment.length == 16);
+
+        // 驗證 input[1] 為 RSC NFT（minting，purpose 0x03）
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[1].nftCommitment.length == 30);
+
+        // 驗證 input[2] 為本 JP NFT（minting，累積中）
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[2].nftCommitment.length == 27);
+        require(tx.inputs[2].nftCommitment.split(1)[0] == 0x0a);
+
+        // Output[2]: RSC NFT，原樣送回合約，不做任何修改
+        require(tx.outputs[2].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[2].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[2].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[2].value == tx.inputs[1].value);
+
+        require(tx.outputs.length == 6, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // declareGameOver: 宣告遊戲永久結束，觸發條件：
+    // 連續 4 期取消（CanceledRoundNFT 輪次連續遞增）且最新一張未被超越
+    // （Input[4].round == drawingRound - 1），任何人皆可觸發。
+    //
+    // 交易結構：
+    //   Input[0]    = 本合約 RoundSwitchControlNFT（minting）
+    //   Input[1..4] = CanceledRoundNFT × 4（FixedPrizePool 地址，minting，永久保留；輪次遞增，
+    //                 各自呼叫 FixedPrizePool.useForDeclareGameOver()）
+    //   Input[5+]   = 觸發者 plain BCH（支付手續費）
+    //
+    //   Output[0]    = RoundSwitchControlNFT（原樣送回，僅 gameOverFlag 改為 0x01）
+    //   Output[1..4] = CanceledRoundNFT × 4（原樣送回，不變）
+    //   Output[5]    = 找零 BCH
+    // ─────────────────────────────────────────────────────────────
+    function declareGameOver() {
+        require(this.activeInputIndex == 0, "RSC contract must always be at input index 0");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 30);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x03);
+        bytes2 rscDrawingRoundB = tx.inputs[0].nftCommitment.slice(1, 3);
+        bytes28 rscHeadB = tx.inputs[0].nftCommitment.slice(0, 28);
+        require(tx.inputs[0].nftCommitment.slice(28, 29) == 0x00, "Game already declared over");
+        // aggregateBatchFlag（尾端新增的第 30 個 byte）原樣保留，宣告結束遊戲與彙整批次進度無關
+        bytes1 rscBatchFlagB = tx.inputs[0].nftCommitment.slice(29, 30);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 12);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x07);
+        int round1 = int(tx.inputs[1].nftCommitment.slice(1, 3));
+
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[2].nftCommitment.length == 12);
+        require(tx.inputs[2].nftCommitment.slice(0, 1) == 0x07);
+        int round2 = int(tx.inputs[2].nftCommitment.slice(1, 3));
+        require(round2 == round1 + 1, "CanceledRoundNFT rounds must be consecutive");
+
+        require(tx.inputs[3].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[3].nftCommitment.length == 12);
+        require(tx.inputs[3].nftCommitment.slice(0, 1) == 0x07);
+        int round3 = int(tx.inputs[3].nftCommitment.slice(1, 3));
+        require(round3 == round2 + 1, "CanceledRoundNFT rounds must be consecutive");
+
+        require(tx.inputs[4].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[4].nftCommitment.length == 12);
+        require(tx.inputs[4].nftCommitment.slice(0, 1) == 0x07);
+        int round4 = int(tx.inputs[4].nftCommitment.slice(1, 3));
+        require(round4 == round3 + 1, "CanceledRoundNFT rounds must be consecutive");
+
+        require(round4 == int(rscDrawingRoundB) - 1, "Latest canceled round must not be superseded");
+
+        // Output[0]: RSC NFT，僅 gameOverFlag 改為 0x01，其餘欄位與 value 皆不變
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+        require(tx.outputs[0].nftCommitment == rscHeadB + 0x01 + rscBatchFlagB);
+
+        // Output[1..4]: CanceledRoundNFT 原樣送回（各自對應的 useForDeclareGameOver() 亦會驗證）
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        require(tx.outputs[2].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[2].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[2].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[2].value == tx.inputs[2].value);
+
+        require(tx.outputs[3].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[3].tokenCategory == tx.inputs[3].tokenCategory);
+        require(tx.outputs[3].nftCommitment == tx.inputs[3].nftCommitment);
+        require(tx.outputs[3].value == tx.inputs[3].value);
+
+        require(tx.outputs[4].lockingBytecode == tx.inputs[4].lockingBytecode);
+        require(tx.outputs[4].tokenCategory == tx.inputs[4].tokenCategory);
+        require(tx.outputs[4].nftCommitment == tx.inputs[4].nftCommitment);
+        require(tx.outputs[4].value == tx.inputs[4].value);
+
+        require(tx.outputs[5].tokenCategory == 0x);
+        require(tx.outputs[5].value >= 1000);
+
+        require(tx.outputs.length == 6, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useForJackpotSweep: 供 JackpotPool.sweepAccumulatingAfterGameOver()
+    // 唯讀引用本合約的 RoundSwitchControlNFT，讀取當下 drawingRound／stagedRate。
+    // 本函式不做任何修改，純粹唯讀傳遞。
+    // ─────────────────────────────────────────────────────────────
+    function useForJackpotSweep() {
+        require(this.activeInputIndex == 2, "RSC contract must always be at input index 2");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 27);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x0a);
+        require(tx.inputs[0].nftCommitment.slice(9, 10) == 0x00, "Only accumulating (winnerCount == 0) pools can be swept here");
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[2].nftCommitment.slice(0, 1) == 0x03);
+        require(tx.inputs[2].nftCommitment.length == 30);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[1].value == tx.inputs[2].value);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // endGame:
+    // GameOverNFT 產生後，表示遊戲已結束，系統進入 end-game 模式。
+    // 驗證邏輯只證明「遊戲確實已結束」與「操作者確實是 admin」，
+    // 合約只檢查adminNftCategoryId與gameOverNftCategoryId 原樣輸入與輸出。
+    // 其他完全交由 admin 決定。
+    //
+    // 交易結構：
+    //   Input[0]  = adminNftCategoryId NFT（admin 持有，P2PKH，簽名解鎖）
+    //   Input[1]  = GameOverNFT（任一分片地址，唯讀，透過 RoundShardAuth.useGameOverNFT() 解鎖）
+    //
+    //   Output[0]  = adminNftCategoryId NFT（原樣送回 admin）
+    //   Output[1]  = GameOverNFT（原樣送回）
+    // ─────────────────────────────────────────────────────────────
+    function endGame() {
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+}

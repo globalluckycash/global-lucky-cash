@@ -1,0 +1,202 @@
+pragma cashscript ^0.13.1;
+
+// NumberSalesNFT — one instance per lottery number combination (79,360 total), tracking sales counts across odd/even rounds
+//
+// Commitment format (17 bytes):
+//   [0]     purpose: 0x02
+//   [1-4]   lotteryNumber: [n1, n2, n3, s] (1 byte each)
+//   [5-6]   oddRound: LE uint16 (most recent odd round)
+//   [7-10]  oddCount: LE uint32 (sales count for that odd round)
+//   [11-12] evenRound: LE uint16 (most recent even round)
+//   [13-16] evenCount: LE uint32 (sales count for that even round)
+//
+// Design assumption: round N's draw completes before round N+1's cutoff, so the odd/even fields never collide
+//
+// Each of the 79,360 number combinations has its own contract address: the constructor param lotteryNumber
+// shares the same format as commitment [1-4], so each combination compiles to a distinct address given a
+// different value, allowing direct == comparison without conversion
+
+contract NumberSales(bytes32 authNftCategoryId, bytes32 adminNftCategoryId, bytes4 lotteryNumber) {
+
+    // ─────────────────────────────────────────────────────────────
+    // sellTicket: updates the sales count for this number combination
+    // Primary validation happens in RSA NFT.sellTicket; this contract only performs basic checks
+    // Let N = (tx.outputs.length - 2) / 2 (number of tickets purchased), k = this.activeInputIndex (this contract's input index, 1..N)
+    //
+    // Transaction structure (Input[1..N] / Output[1..N] = this contract):
+    //   Input[0]       = RoundShardAuthNFT (minting)
+    //   Input[1..N]    = NumberSalesNFT × N (mutable, this contract is the k-th one)
+    //   Input[N+1+]    = player's plain BCH
+    //
+    //   Output[0]       = RSA NFT (updated)
+    //   Output[k]   ★   = NumberSalesNFT (odd/even sales count updated, validated by this contract)
+    //   Output[N+k] ★   = TicketNFT (newly minted)
+    //   Output[2N+1]     = BCH change (contract enforces its presence, tx.outputs.length is fixed at 2N+2)
+    // ─────────────────────────────────────────────────────────────
+    function sellTicket() {
+        // Verify input[0] is the RSA NFT (minting)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x01);
+        require(tx.inputs[0].nftCommitment.length == 23);
+
+        // Compute the ticket quantity N and confirm this contract's input index k (1..N)
+        int ticketQuantity = (tx.outputs.length - 2) / 2;
+        int k = this.activeInputIndex;
+
+        require(ticketQuantity >= 1 && ticketQuantity <= 10, "Invalid ticket quantity");
+        require(k >= 1 && k <= ticketQuantity, "Invalid active input index");
+
+        // Verify input[k] is this contract's NS NFT (mutable)
+        require(tx.inputs[k].tokenCategory == authNftCategoryId + 0x01);
+        require(tx.inputs[k].nftCommitment.split(1)[0] == 0x02);
+        require(tx.inputs[k].nftCommitment.length == 17);
+
+        // Self-check: the commitment's lottery number must match this address's constructor param
+        require(tx.inputs[k].nftCommitment.split(1)[1].split(4)[0] == lotteryNumber, "NS commitment lottery number mismatch");
+
+        // Output[0]: RSA NFT (the actual sales/BCH computation is validated by RSA NFT.sellTicket; only basic fields checked here)
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory, "Invalid RSA NFT token category");
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode, "Invalid RSA NFT locking bytecode");
+        require(tx.outputs[0].nftCommitment.split(1)[0] == 0x01, "Invalid RSA NFT purpose byte");
+        require(tx.outputs[0].nftCommitment.length == 23, "Invalid RSA NFT commitment length");
+
+        // Output[k]: NumberSalesNFT (the full odd/even sales count computation is validated by RSA NFT.sellTicket; only basic fields checked here)
+        require(tx.outputs[k].lockingBytecode == tx.inputs[k].lockingBytecode);
+        require(tx.outputs[k].tokenCategory == tx.inputs[k].tokenCategory);
+        require(tx.outputs[k].value == 1000, "Invalid NS NFT value");
+        require(tx.outputs[k].nftCommitment.split(1)[0] == 0x02, "Invalid NS NFT purpose byte");
+        require(tx.outputs[k].nftCommitment.length == 17);
+
+        int changeIdx = ticketQuantity * 2 + 1;
+        require(tx.outputs.length == (changeIdx + 1), "Invalid number of outputs - should have equal amount of outputs as ticket quantity *2 + 2");
+
+        // Output[2N+1]: BCH change (basic fields only; the actual destination is guaranteed by RSA NFT.sellTicket or the player's signature)
+        require(tx.outputs[changeIdx].tokenCategory == 0x, "Invalid BCH change output");
+        require(tx.outputs[changeIdx].value >= 1000, "Invalid BCH change output");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // verifyWin: validates the prize-verification transaction (called regardless of whether anyone won)
+    // Primary validation happens in JackpotPool.cash; this contract only performs basic checks
+    //
+    // Transaction structure (Input[2] / Output[1] = this contract):
+    //   Input[0] = JackpotPoolNFT (JP contract, minting, calls verifyWin())
+    //   Input[1] = WinningNumberNFT
+    //   Input[2] = NumberSalesNFT
+    //   Input[3] = this contract (RoundSwitchControlNFT)
+    //   Input[4+] = plain BCH (required, used to pay fees and fund the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT old pool
+    //   Output[1] = NumberSalesNFT (passed through unchanged)
+    //   Output[2] = RoundSwitchControlNFT (passed through unchanged)
+    //   Output[3] = execution reward address (plain BCH, fixed at 1 USD, funded from WinningNumberNFT)
+    //   Output[4] = PlatformPool
+    //   Output[5] = JackpotPoolNFT new pool (only minted if someone won)
+    //   Output[5 or 6] = BCH change (separate from the execution reward, shifted depending on whether a new pool is minted)
+    //   If too few tickets were sold, no reward is paid out — with no execution incentive, the platform must cover the fee itself.
+    //
+    // ─────────────────────────────────────────────────────────────
+    function verifyWin() {
+        require(this.activeInputIndex == 2, "NumberSalesNFT contract must always be at input index 2");
+
+        // Verify input[0] is the JP NFT (minting, purpose 0x0A)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Verify input[1] is the WN NFT (immutable, purpose 0x05)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x05);
+        require(tx.inputs[1].nftCommitment.length == 16);
+
+        // Verify input[2] is this NS NFT (mutable, purpose 0x02)
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x01);
+        require(tx.inputs[2].nftCommitment.split(1)[0] == 0x02);
+        require(tx.inputs[2].nftCommitment.length == 17);
+
+        // Self-check: the commitment's lottery number must match this address's constructor param
+        require(tx.inputs[2].nftCommitment.split(1)[1].split(4)[0] == lotteryNumber, "NS commitment lottery number mismatch");
+
+        // Verify input[3] is the RSC NFT (minting, purpose 0x03, 30 bytes)
+        require(tx.inputs[3].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[3].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[3].nftCommitment.length == 30);
+
+        // Output[0]: JackpotPoolNFT old pool (the actual contents are validated by JackpotPool.verifyWin; only basic fields checked here)
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.outputs[0].nftCommitment.length == 27);
+        require(tx.outputs[0].value >= 1000);
+
+        // Output[1]: NumberSalesNFT passed through unchanged
+        require(tx.outputs[1].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[2].value);
+
+        // Output[2]: RoundSwitchControlNFT passed through unchanged
+        require(tx.outputs[2].nftCommitment == tx.inputs[3].nftCommitment);
+        require(tx.outputs[2].tokenCategory == tx.inputs[3].tokenCategory);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[2].value == tx.inputs[3].value);
+
+        // Output[3]: execution reward address (plain BCH, amount validated by JackpotPool.verifyWin; only destination and basic fields checked here)
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[4].lockingBytecode);
+        require(tx.outputs[3].value >= 1000);
+
+        // Output[4]: PlatformPool (amount validated by JackpotPool.verifyWin; only basic fields checked here)
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].value >= 1000);
+
+        // Output[5] (new jackpot pool) only exists if someone won, immediately followed by the change output, so total output count is 6 or 7
+        // tx.outputs.length == 6: no winner
+        if (tx.outputs.length == 6) {
+            require(tx.outputs[5].tokenCategory == 0x);
+            require(tx.outputs[5].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[5].value >= 1000);
+
+            require(tx.outputs.length == 6, "Invalid number of outputs");
+        } else {
+            require(tx.outputs[5].tokenCategory == authNftCategoryId + 0x02);
+            require(tx.outputs[5].nftCommitment.split(1)[0] == 0x0a);
+            require(tx.outputs[5].nftCommitment.length == 27);
+            require(tx.outputs[5].value >= 1000);
+
+            require(tx.outputs[6].tokenCategory == 0x);
+            require(tx.outputs[6].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[6].value >= 1000);
+            require(tx.outputs.length == 7, "Invalid number of outputs");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // endGame:
+    // Once a GameOverNFT exists, the game has ended and the system enters end-game mode.
+    // The validation logic only proves that "the game has indeed ended" and "the caller is indeed the admin";
+    // the contract only checks that adminNftCategoryId and gameOverNftCategoryId are passed through unchanged.
+    // Everything else is entirely up to the admin's discretion.
+    //
+    // Transaction structure:
+    //   Input[0]  = adminNftCategoryId NFT (held by admin, P2PKH, unlocked via signature)
+    //   Input[1]  = GameOverNFT (any shard address, read-only, unlocked via RoundShardAuth.useGameOverNFT())
+    //
+    //   Output[0]  = adminNftCategoryId NFT (passed back to admin unchanged)
+    //   Output[1]  = GameOverNFT (passed through unchanged)
+    // ─────────────────────────────────────────────────────────────
+    function endGame() {
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+}

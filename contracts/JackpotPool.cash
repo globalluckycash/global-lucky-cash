@@ -1,0 +1,1027 @@
+pragma cashscript ^0.13.1;
+
+// JackpotPoolNFT — the grand jackpot pool; accumulates the jackpot across rounds and,
+// whenever someone wins, archives the current pool and mints a fresh one
+//
+// Commitment layout (19 bytes, LE):
+//   [0]     purpose: 0x0A
+//   [1-2]   accumulateFrom: LE uint16 (round from which accumulation started)
+//   [3-4]   currentDrawRound: LE uint16 (the round currently being paid out)
+//   [5-8]   winningNumber: [n1, n2, n3, s] (1 byte each)
+//   [9]     winnerCount: uint8 (number of winners; fixed once written)
+//   [10]    claimCount: uint8 (winners who haven't claimed yet; decrements per claim)
+//   [11-18] totalBCH: LE int64 (JP's accumulated balance)
+//   [19-26] lastClaimTime: LE int64 (last time a claim was made)
+contract JackpotPool(bytes32 authNftCategoryId, bytes fixedPrizePoolLockingBytecode, bytes platformPoolLockingBytecode, bytes32 adminNftCategoryId, int ticketPriceCents) {
+
+    // ─────────────────────────────────────────────────────────────
+    // verifyWin: validates the payout-verification transaction (called whether or not
+    // anyone actually won). JackpotPool.cash (this contract) is the primary validating
+    // contract here, so review it carefully.
+    //
+    // Transaction structure (Input[0,1] / Output[0,2] = this contract):
+    //   Input[0] = JackpotPoolNFT (JP contract, minting, calls verifyWin())
+    //   Input[1] = WinningNumberNFT (value = dust + platform share carried over from draw())
+    //   Input[2] = NumberSalesNFT
+    //   Input[3] = RoundSwitchControlNFT
+    //   Input[4+] = Plain BCH (required, covers the fee and funds the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT, old pool (no execution reward deducted; players can claim in full)
+    //   Output[1] = NumberSalesNFT (passed through unchanged)
+    //   Output[2] = RoundSwitchControlNFT (passed through unchanged)
+    //   Output[3] = execution reward address (plain BCH, fixed at 1 USD, funded from WinningNumberNFT)
+    //   Output[4] = PlatformPool (plain BCH, remainder after the reward is deducted)
+    //   Output[5] = JackpotPoolNFT, new pool (minted only when someone won)
+    //   Output[5 or 6] = change BCH (separate from the execution reward; shifts depending on whether a new pool was minted)
+    //   The execution reward is a fixed 1 USD equivalent, computed from the WN's own carried-over
+    //   sale rate (the same rate used for the wnBCH buffer), independent of any rate movement
+    //   between draw() and verifyWin() — this keeps the amount exact with no shortfall.
+    //
+    // ─────────────────────────────────────────────────────────────
+    function verifyWin() {
+        require(this.activeInputIndex == 0, "JackpotPool contract must always be at input index 0");
+
+        // Parse the existing JP commitment
+        bytes1 jpPurposeB, bytes jpR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 jpAccumulateFromB, bytes jpR2 = jpR1.split(2);
+        bytes1 jpWinnerCountB =jpR2.slice(6,7);
+        bytes8 jptotalBCHB =jpR2.slice(8,16);
+
+        // Verify input[0] is this contract's JP NFT (minting)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Ensure this round hasn't already accumulated a jackpot
+        require(jpWinnerCountB == 0x00);
+
+        // WN commitment layout (16 bytes):
+        //   [0]    purpose: 0x05
+        //   [1-2]  drawRound: LE uint16
+        //   [3]    n1, [4] n2, [5] n3, [6] s
+        //   [7-11] cumulativeSales: LE uint40
+        //   [12-15] saleRate: LE uint32 (this round's actual sale rate)
+        bytes1 wnPurposeByte,  bytes wnR1 = tx.inputs[1].nftCommitment.split(1);
+        bytes2 wnRoundBytes,   bytes wnR2 = wnR1.split(2);
+        bytes4 winningNumB,    bytes wnR3 = wnR2.split(4);
+        bytes4 wnSaleRateB = unsafe_bytes4(wnR3.split(5)[1]);
+
+        // Verify input[1] is the WN NFT (immutable, purpose 0x05)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(wnPurposeByte == 0x05);
+        require(tx.inputs[1].nftCommitment.length == 16);
+
+        // Parse the NS commitment to get sales volume for this round's winning number
+        bytes1 nsPurposeByte, bytes nsR1 = tx.inputs[2].nftCommitment.split(1);
+        bytes4 lotteryNumB, bytes nsR2 = nsR1.split(4);
+        bytes2 oddRoundB,   bytes nsR3 = nsR2.split(2);
+        bytes4 oddCountB,   bytes nsR4 = nsR3.split(4);
+        bytes2 evenRoundB,  bytes nsR5 = nsR4.split(2);
+        bytes4 evenCountB = unsafe_bytes4(nsR5);
+
+        // Verify input[2] is the NS NFT (mutable, purpose 0x02)
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x01);
+        require(nsPurposeByte == 0x02);
+        require(tx.inputs[2].nftCommitment.length == 17);
+        require(winningNumB == lotteryNumB);
+
+        // Verify input[3] is the RSC NFT (minting, purpose 0x03)
+        require(tx.inputs[3].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[3].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[3].nftCommitment.length == 30);
+
+        // Parse the RSC commitment: [3-10] = cutoffTime LE int64
+        bytes8 cutoffTimeB = tx.inputs[3].nftCommitment.slice(3, 11);
+        bytes8 lastClaimTimeB = toPaddedBytes(int(cutoffTimeB) + 7776000, 8);
+
+        int winCount = 0;
+        int wnRound = int(wnRoundBytes);
+        if (wnRound % 2 == 1) {
+            if (oddRoundB == wnRoundBytes) {
+                winCount = int(oddCountB);
+            }
+        } else {
+            if (evenRoundB == wnRoundBytes) {
+                winCount = int(evenCountB);
+            }
+        }
+
+        // Assemble the new JP commitment (old pool: archives this round's result)
+        bytes1 oldJpWinnerCountB = toPaddedBytes(winCount, 1);
+        bytes27 oldJpC = jpPurposeB + jpAccumulateFromB + wnRoundBytes + winningNumB + oldJpWinnerCountB + oldJpWinnerCountB + jptotalBCHB + lastClaimTimeB;
+
+        // Output[0]: JackpotPoolNFT, old pool (the reward is now paid from WinningNumberNFT, so this pool's full balance is preserved for player claims)
+        require(tx.outputs[0].nftCommitment == oldJpC);
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        // Output[1]: NumberSalesNFT
+        require(tx.outputs[1].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[2].value);
+
+        // Output[2]: roundSwitchControlNFT
+        require(tx.outputs[2].nftCommitment == tx.inputs[3].nftCommitment);
+        require(tx.outputs[2].tokenCategory == tx.inputs[3].tokenCategory);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[2].value == tx.inputs[3].value);
+
+        // Compute the execution reward (a fixed 1 USD equivalent; never zeroed out for low ticket volume).
+        int wnBCH = tx.inputs[1].value;
+        // wnSaleRateB is scaled up 100x (ATTESTATION_SCALING), so it must be unscaled to get the 1 USD-equivalent sats value
+        int executeShare = 10_000_000_000 / int(wnSaleRateB);
+        // After deducting this execution reward from the WN's carried balance, also deduct 1000
+        // as Output[4] PlatformPool's own dust so the operator doesn't have to top it up;
+        // what's left is the actual balance transferred to PlatformPool.
+        int leftoverBCH = wnBCH - executeShare - 1000;
+        if (leftoverBCH < 0) {
+            leftoverBCH = 0;
+        }
+
+        // Output[3]: execution reward address (plain BCH, fixed 1 USD)
+        require(tx.outputs[3].lockingBytecode == tx.inputs[4].lockingBytecode);
+        require(tx.outputs[3].value == executeShare);
+        require(tx.outputs[3].tokenCategory == 0x);
+
+        // Output[4]: PlatformPool (WinningNumberNFT's remaining balance)
+        require(tx.outputs[4].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].value == 1000 + leftoverBCH);
+
+        if (winCount > 0) {
+            // Output[5]: mint the next accumulating pool (starts accumulating from next round, not yet drawn)
+            bytes2 newJpAccumulateFromB = toPaddedBytes(wnRound + 1, 2);
+            bytes27 newJpNewC = jpPurposeB + newJpAccumulateFromB + wnRoundBytes + 0x00000000 + 0x00 + 0x00 + 0x0000000000000000 + 0x0000000000000000;
+            require(tx.outputs[5].nftCommitment == newJpNewC);
+            require(tx.outputs[5].tokenCategory == tx.inputs[0].tokenCategory);
+            require(tx.outputs[5].lockingBytecode == tx.inputs[0].lockingBytecode);
+            require(tx.outputs[5].value == 1000);
+
+            // Output[6]: change BCH (separate from the execution reward)
+            require(tx.outputs[6].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[6].value >= 1000);
+            require(tx.outputs[6].tokenCategory == 0x);
+            require(tx.outputs.length == 7);
+        } else {
+            // Output[5]: change BCH
+            require(tx.outputs[5].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[5].value >= 1000);
+            require(tx.outputs[5].tokenCategory == 0x);
+            require(tx.outputs.length == 6);
+        }
+    }
+
+
+    // ─────────────────────────────────────────────────────────────
+    // enterDrawingPhase: once all shards have switched, allocates funds and creates the DrawingNFT
+    // Primary validation lives in RSC.cash; this only does baseline checks
+    //
+    // Transaction structure (Input[0] / Output[2] = this contract):
+    //   Input[0] = JackpotPoolNFT (minting, purpose 0x0A)
+    //   Input[1] = RSC NFT (minting, holds all the BCH)
+    //   Input[2] = ConfigNFT (none, purpose 0x06)
+    //   Input[3+] = Plain BCH (required, covers the fee and funds the reward)
+    //
+    //   Output[0] = FixedPrizePool (plain BCH, no NFT, = 30%)
+    //   Output[1] = PlatformPool (plain BCH, no NFT, = 20%)
+    //   Output[2] = JackpotPoolNFT (commitment updates totalBCH, BCH += 50%)
+    //   Output[3] = RSC NFT (round+1, cutoffTime recomputed, cumulativeSales=0, last-aggregation time reset)
+    //   Output[4] = Drawing NFT (newly minted, minting, purpose 0x04, value = dust + fixed 3 USD reserve)
+    //   Output[5] = execution reward address (plain BCH, fixed 1 USD)
+    //   Output[6] = ConfigNFT (identical to the input)
+    //   Output[7] = change BCH (separate from the execution reward; the contract enforces its presence)
+    //   DrawingNFT always reserves a 3 USD equivalent (1 USD execution reward each for draw()/verifyWin()
+    //   plus a 1 USD buffer); if the platform share is under 3 USD, DrawingNFT must still receive the full
+    //   3 USD, with the executor covering the shortfall via Input[3].
+    //
+    // ─────────────────────────────────────────────────────────────
+    function enterDrawingPhase() {
+        // Verify input[0] is this contract's JackpotPoolNFT (minting, purpose 0x0A)
+        require(this.activeInputIndex == 0, "JackpotPool contract must always be at input index 0");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Verify input[1] is the RSC NFT (minting, purpose 0x03)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[1].nftCommitment.length == 30);
+
+        // Verify input[2] is the ConfigNFT (none capability, purpose 0x06, 19 bytes;
+        // see the settledRate field noted in RoundSwitchControl.cash useConfigForAggregate())
+        require(tx.inputs[2].tokenCategory == authNftCategoryId);
+        require(tx.inputs[2].nftCommitment.split(1)[0] == 0x06);
+        require(tx.inputs[2].nftCommitment.length == 19);
+
+        // Output[0]: FixedPrizePool (amount validated by RSC.enterDrawingPhase; only destination and basic fields checked here)
+        require(tx.outputs[0].tokenCategory == 0x);
+        require(tx.outputs[0].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[0].value >= 1000);
+
+        // Output[1]: PlatformPool (amount validated by RSC.enterDrawingPhase; only destination and basic fields checked here)
+        require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs[1].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[1].value >= 1000);
+
+        // Output[2]: this contract's JackpotPoolNFT (the actual totalBCH computation is validated by RSC.enterDrawingPhase; only basic fields checked here)
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[2].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[2].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.outputs[2].nftCommitment.length == 27);
+        require(tx.outputs[2].value >= tx.inputs[0].value);
+
+        // Output[3]: RSC NFT (actual contents validated by RSC.enterDrawingPhase; only basic fields checked here)
+        require(tx.outputs[3].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[3].nftCommitment.split(1)[0] == 0x03);
+        require(tx.outputs[3].nftCommitment.length == 30);
+        require(tx.outputs[3].value >= 1000);
+
+        // Output[4]: DrawingNFT (newly minted; actual contents validated by RSC.enterDrawingPhase; only NFT type and basic fields checked here)
+        require(tx.outputs[4].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[4].nftCommitment.split(1)[0] == 0x04);
+        require(tx.outputs[4].nftCommitment.length == 16);
+        require(tx.outputs[4].value >= 1000);
+
+        // Output[5]: execution reward address (plain BCH; amount validated by RSC.enterDrawingPhase; only destination and basic fields checked here)
+        require(tx.outputs[5].tokenCategory == 0x);
+        require(tx.outputs[5].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[5].value >= 1000);
+
+        // Output[6]: ConfigNFT (must be identical)
+        require(tx.outputs[6].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[6].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[6].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[6].value == tx.inputs[2].value);
+
+        // Output[7]: change BCH (separate from the execution reward)
+        require(tx.outputs[7].tokenCategory == 0x);
+        require(tx.outputs[7].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[7].value >= 1000);
+
+        require(tx.outputs.length == 8, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // claimJackpot: jackpot claim transaction
+    //
+    // Transaction structure (Input[0] / Output[0] = this contract):
+    //   Input[0] = JackpotPoolNFT
+    //   Input[1] = TicketNFT (held by the player, P2PKH, none; burned)
+    //   Input[2+] = Plain BCH (required, covers the fee)
+    //
+    //   Output[0] = JackpotPoolNFT (BCH -= claimed amount; claimCount -= 1)
+    //   Output[1] = TicketNFT (newly minted, claimStatus=01, returned to the player)
+    //   Output[2] = claimed BCH -> player
+    //   Output[3] = change BCH
+    // ─────────────────────────────────────────────────────────────
+    function claimJackpot() {
+        require(this.activeInputIndex == 0, "JackpotPool contract must always be at input index 0");
+
+        // Parse the existing JP commitment
+        bytes1 jpPurposeB, bytes jpR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 jpAccumulateFromB,   bytes jpR2 = jpR1.split(2);
+        bytes2 jpCurrentDrawRoundB, bytes jpR3 = jpR2.split(2);
+        bytes4 jpWinNumB,           bytes jpR4 = jpR3.split(4);
+        bytes1 jpWinnerCountB,      bytes jpR5 = jpR4.split(1);
+        bytes1 jpRemainingClaimB,   bytes jpR6 = jpR5.split(1);
+        bytes8 jptotalBCHB,         bytes jpR7 = jpR6.split(8);
+        bytes8 jpLastClaimTimeB = unsafe_bytes8(jpR7);
+
+        // Verify input[0] is this JP NFT
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        int jpRemainingClaim = int(jpRemainingClaimB);
+
+        // Verify there are still unclaimed tickets
+        require(jpRemainingClaim > 0);
+
+        // Verify input[1] is the TicketNFT (none capability)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 14);
+
+        // Parse the TicketNFT commitment (14 bytes, BE, with 0xff separators)
+        // [0-1]=round BE, [2]=ff, [3-6]=numbers, [7]=ff, [8-11]=rate BE, [12]=ff, [13]=claimStatus
+        bytes3 tRoundBEWithFfB, bytes tR1 = tx.inputs[1].nftCommitment.split(3);
+        bytes4 ticketNumB,      bytes tR2 = tR1.split(4);
+        bytes1 tClaimStatusB = tR2.slice(6,7);
+
+        // Convert round from BE to LE (the JP commitment's round is LE uint32, while TicketNFT stores it as BE uint16)
+        bytes1 tRoundH, bytes tRoundR1 = tRoundBEWithFfB.split(1);
+        bytes2 ticketRoundLE = tRoundR1.split(1)[0] + tRoundH;
+
+        // Verify the ticket's round == JP's current draw round
+        require(ticketRoundLE == jpCurrentDrawRoundB);
+        // Verify the numbers match
+        require(ticketNumB == jpWinNumB);
+        // Verify it hasn't been claimed yet
+        require(tClaimStatusB == 0x00);
+
+        // Compute the claim amount — each TicketNFT is fixed at 1 ticket, entitled to a 1/claimCount share
+        int jpValue     = tx.inputs[0].value;
+        int prizeAmount = (jpValue / jpRemainingClaim) - (1000 / jpRemainingClaim);
+        int newJpValue  = jpValue - prizeAmount;
+        require(newJpValue >= 1000); // must retain dust
+
+        // Update the JP (jpRemainingClaim -= 1)
+        bytes newJPCommitment = jpPurposeB + jpAccumulateFromB + jpCurrentDrawRoundB + jpWinNumB + jpWinnerCountB + toPaddedBytes(jpRemainingClaim - 1, 1) + jptotalBCHB + jpLastClaimTimeB;
+
+        require(tx.outputs[0].nftCommitment == newJPCommitment);
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == newJpValue);
+
+        // Output[1]: newly minted TicketNFT (claimStatus set to 0x01, all other fields unchanged; returned to the player;
+        // 0x01 is jackpot-only — fixed-prize tiers use 0x02-0x05 instead, see FixedPrizePool.cash claimFixedPrize()
+        // and the bcmr/chipnet.json type mapping)
+        // The original TicketNFT (none) is burned (does not appear in the outputs), re-minted under this contract's minting capability
+        bytes newTicketC = tx.inputs[1].nftCommitment.split(13)[0] + 0x01;
+        require(tx.outputs[1].nftCommitment == newTicketC);
+        require(tx.outputs[1].tokenCategory == authNftCategoryId); // none capability
+        require(tx.outputs[1].value == tx.inputs[1].value);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode); // ensure the new TicketNFT goes back to the player
+
+        // Output[2]: pays out the claimed amount to the player
+        require(tx.outputs[2].tokenCategory == 0x); // plain BCH
+        require(tx.outputs[2].value == prizeAmount);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[1].lockingBytecode); // ensure the prize goes to the ticket holder
+
+        // Output[3]: change BCH
+        require(tx.outputs[3].tokenCategory == 0x); // plain BCH
+        require(tx.outputs[3].value >= 1000);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode); // ensure change goes to the ticket holder
+
+        require(tx.outputs.length == 4, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // processExpired: expiry-handling transaction (burns the expired JP, redistributes BCH 60/35/4/1)
+    //
+    // Transaction structure (Input[0,1] / Output[0,1] = this contract):
+    //   Input[0] = JackpotPoolNFT (expired pool, minting, burned)
+    //   Input[1] = next JackpotPoolNFT (accumulating, minting, receives 60%)
+    //   Input[2+] = Plain BCH (required, covers the fee and funds the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT (BCH = dust)
+    //   Output[1] = next JackpotPoolNFT (BCH += 60%)
+    //   Output[2] = fixed prize pool address (plain BCH, no NFT, = expired prize × 35%)
+    //   Output[3] = platform pool address (plain BCH, no NFT, = expired prize × 4%)
+    //   Output[4] = execution reward address (plain BCH, no NFT, = expired prize × 1%, excluding change)
+    //   Output[5] = change BCH (separate from the execution reward; the contract enforces its presence)
+    //   If the reward is too small to incentivize execution, the platform must cover the fee itself.
+    // ─────────────────────────────────────────────────────────────
+    function processExpired() {
+        require(this.activeInputIndex == 0, "JackpotPool contract must always be at input index 0");
+
+        // Parse the existing JP commitment
+        bytes1 jpPurposeB,           bytes jpR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes9 jpOrginalCommitmentB, bytes jpR2 = jpR1.split(9);
+        bytes1 jpRemainingClaimB,    bytes jpR3 = jpR2.split(1);
+        bytes8 jptotalBCHB,          bytes jpR4 = jpR3.split(8);
+        bytes8 jpLastClaimTimeB = unsafe_bytes8(jpR4);
+
+        // Verify input[0] is this JP NFT (expired pool)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Verify claimCount > 0 (this pool is in a won-but-pending-claim state)
+        require(int(jpRemainingClaimB) > 0);
+
+        // Verify it has actually expired (tx.time >= lastClaimTime + 1 is equivalent to tx.time > lastClaimTime)
+        require(tx.time >= int(jpLastClaimTimeB));
+
+        // Verify input[1] is a JP NFT (the next accumulating pool, to prevent a non-JP NFT being substituted in and redirecting the jackpotShare elsewhere)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.inputs[1].nftCommitment.length == 27);
+
+        int expiredBCH    = tx.inputs[0].value - 1000; // deduct the JackpotPoolNFT's dust
+        int jackpotShare  = expiredBCH * 60 / 100;
+        int fixedShare    = expiredBCH * 35 / 100;
+        int platformShare = expiredBCH * 4 / 100;
+        int executeShare  = expiredBCH - jackpotShare - fixedShare - platformShare;
+
+        // Output[0]: JackpotPool address (BCH = dust)
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].nftCommitment == jpPurposeB + jpOrginalCommitmentB + 0x00 + jptotalBCHB + jpLastClaimTimeB);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].value == 1000);
+
+        // Output[1]: next JackpotPool address (BCH += 60%)
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].value == tx.inputs[1].value + jackpotShare);
+
+        // Output[2]: fixed prize pool address (plain BCH, no NFT, += 35%)
+        require(tx.outputs[2].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[2].value == fixedShare);
+
+        // Output[3]: platform pool address (plain BCH, no NFT, += 4%)
+        require(tx.outputs[3].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].value == platformShare);
+
+        // Output[4]: execution reward address (plain BCH, no NFT, exactly 1%, excluding change)
+        require(tx.outputs[4].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].value == executeShare);
+
+        // Output[5]: change BCH (separate from the execution reward)
+        require(tx.outputs[5].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[5].tokenCategory == 0x);
+        require(tx.outputs[5].value >= 1000);
+
+        // Ensure there are exactly 6 outputs
+        require(tx.outputs.length == 6);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // receiveExpiredJackpot: expiry-handling transaction (burns the expired JP, redistributes BCH 60/35/4/1)
+    // Primarily validated by processExpired(); this only does baseline checks
+    //
+    // Transaction structure (Input[0,1] / Output[0,1] = this contract):
+    //   Input[0] = JackpotPoolNFT (expired pool, minting, burned)
+    //   Input[1] = next JackpotPoolNFT (accumulating, minting, receives 60%)
+    //   Input[2+] = Plain BCH (required, covers the fee and funds the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT (BCH = dust)
+    //   Output[1] = next JackpotPoolNFT (BCH += 60%)
+    //   Output[2] = fixed prize pool address (plain BCH, no NFT, = expired prize × 35%)
+    //   Output[3] = platform pool address (plain BCH, no NFT, = expired prize × 4%)
+    //   Output[4] = execution reward address (plain BCH, no NFT, = expired prize × 1%, excluding change)
+    //   Output[5] = change BCH (separate from the execution reward)
+    //   If the reward is too small to incentivize execution, the platform must cover the fee itself.
+    // ─────────────────────────────────────────────────────────────
+    function receiveExpiredJackpot() {
+        // Verify input[0] is the expired JP (called by processExpired)
+        bytes1 jpPurposeB        = tx.inputs[0].nftCommitment.slice(0, 1);
+        bytes1 jpRemainingClaimB = tx.inputs[0].nftCommitment.slice(10, 11);
+        bytes8 jpLastClaimTimeB  = tx.inputs[0].nftCommitment.slice(19, 27);
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+        // Verify claimCount > 0 (this pool is in a won-but-pending-claim state)
+        require(int(jpRemainingClaimB) > 0);
+        // Verify it has actually expired (tx.time >= lastClaimTime + 1 is equivalent to tx.time > lastClaimTime)
+        require(tx.time >= int(jpLastClaimTimeB));
+
+        require(this.activeInputIndex == 1, "JackpotPool contract must always be at input index 1");
+        // Verify input[1] is this JP NFT
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.inputs[1].nftCommitment.length == 27);
+
+        // Output[0]: expired JP retains only dust after being burned (the exact deduction is validated by processExpired)
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.outputs[0].nftCommitment.length == 27);
+        require(tx.outputs[0].value == 1000);
+
+        // Output[1]: this JP's BCH must increase (the exact amount is validated by processExpired)
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value >= tx.inputs[1].value);
+
+        // Output[2]: fixed prize pool address (amount validated by processExpired; only destination and basic fields checked here)
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[2].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[2].value >= 1000);
+
+        // Output[3]: platform pool address (amount validated by processExpired; only destination and basic fields checked here)
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[3].value >= 1000);
+
+        // Output[4]: execution reward address (amount validated by processExpired; only destination and basic fields checked here)
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[4].value >= 1000);
+
+        // Output[5]: change BCH
+        require(tx.outputs[5].tokenCategory == 0x);
+        require(tx.outputs[5].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[5].value >= 1000);
+
+        require(tx.outputs.length == 6, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // spendWinningNumber: authorizes burning the WinningNumberNFT (Input[1]) held at this contract's address
+    //
+    // Transaction structure (Input[0,1] / Output[0,3] = this contract):
+    //   Input[0] = JackpotPoolNFT (JP contract, minting, calls verifyWin())
+    //   Input[1] = WinningNumberNFT
+    //   Input[2] = NumberSalesNFT
+    //   Input[3] = RoundSwitchControlNFT
+    //   Input[4+] = Plain BCH (required, covers the fee and funds the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT, old pool
+    //   Output[1] = NumberSalesNFT (passed through unchanged)
+    //   Output[2] = RoundSwitchControlNFT (passed through unchanged)
+    //   Output[3] = execution reward address (plain BCH, exactly 1 USD)
+    //   Output[4] = PlatformPool
+    //   Output[5] = JackpotPoolNFT, new pool (minted only when someone won)
+    //   Output[5 or 6] = change BCH (separate from the execution reward; shifts depending on whether a new pool was minted)
+    //   The execution reward is a fixed 1 USD equivalent, never zeroed out for low ticket volume;
+    //   the executor must cover any shortfall themselves.
+    //
+    // ─────────────────────────────────────────────────────────────
+    function spendWinningNumber() {
+        require(this.activeInputIndex == 1, "WinningNumberNFT contract must always be at input index 1");
+
+        // Verify input[0] is this contract's JP NFT (minting)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+
+        // Verify input[1] is this WN NFT (immutable, purpose 0x05)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x05);
+        require(tx.inputs[1].nftCommitment.length == 16);
+
+        // Verify input[2] is the NS NFT (mutable, purpose 0x02)
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x01);
+        require(tx.inputs[2].nftCommitment.split(1)[0] == 0x02);
+        require(tx.inputs[2].nftCommitment.length == 17);
+
+        // Verify input[3] is the RSC NFT (minting, purpose 0x03)
+        require(tx.inputs[3].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[3].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[3].nftCommitment.length == 30);
+
+        // Output[0]: JackpotPoolNFT, old pool (actual contents validated by JackpotPool.verifyWin; only basic fields checked here)
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.outputs[0].nftCommitment.length == 27);
+        require(tx.outputs[0].value >= 1000);
+
+        // Output[1]: NumberSalesNFT passed through unchanged
+        require(tx.outputs[1].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[2].value);
+
+        // Output[2]: RoundSwitchControlNFT passed through unchanged
+        require(tx.outputs[2].nftCommitment == tx.inputs[3].nftCommitment);
+        require(tx.outputs[2].tokenCategory == tx.inputs[3].tokenCategory);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[3].lockingBytecode);
+        require(tx.outputs[2].value == tx.inputs[3].value);
+
+        // Output[3]: execution reward address (plain BCH; amount validated by JackpotPool.verifyWin; only destination and basic fields checked here)
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[4].lockingBytecode);
+        require(tx.outputs[3].value >= 1000);
+
+        // Output[4]: PlatformPool (amount validated by JackpotPool.verifyWin; only destination and basic fields checked here)
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].lockingBytecode == platformPoolLockingBytecode);
+        require(tx.outputs[4].value >= 1000);
+
+        // Output[5] (the new jackpot pool) exists only when someone won, immediately followed by the change output, so the total output count is 6 or 7
+        // tx.outputs.length == 6: no one won
+        if (tx.outputs.length == 6) {
+            // Output[5] = change BCH
+            require(tx.outputs[5].tokenCategory == 0x);
+            require(tx.outputs[5].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[5].value >= 1000);
+
+            require(tx.outputs.length == 6, "Invalid number of outputs");
+        } else {
+            // Output[5] = new jackpot pool
+            require(tx.outputs[5].tokenCategory == authNftCategoryId + 0x02);
+            require(tx.outputs[5].nftCommitment.split(1)[0] == 0x0a);
+            require(tx.outputs[5].nftCommitment.length == 27);
+            require(tx.outputs[5].value >= 1000);
+
+            // Output[6] = change BCH
+            require(tx.outputs[6].tokenCategory == 0x);
+            require(tx.outputs[6].lockingBytecode == tx.inputs[4].lockingBytecode);
+            require(tx.outputs[6].value >= 1000);
+            require(tx.outputs.length == 7, "Invalid number of outputs");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // cancelDraw: in a draw-expiry cancellation transaction, claws back this round's already-
+    // deposited share into the fixed prize pool
+    // Primary validation lives in Drawing.cash; this only validates this contract's own
+    // JackpotPoolNFT output
+    //
+    // Transaction structure (Input[2] / Output[3] = this contract):
+    //   Input[0] = DrawingNFT (minting, purpose 0x04, burned; trigger conditions validated by Drawing.cancelDraw())
+    //   Input[1] = RoundSwitchControlNFT (minting, purpose 0x03, read-only; validated by RSC.cancelDraw())
+    //   Input[2] = JackpotPoolNFT (minting, purpose 0x0A, accumulating, this contract)
+    //   Input[3+] = triggerer's plain BCH (required, covers the fee and funds the execution reward)
+    //
+    //   Output[0] = fixed prize pool address (plain BCH, no NFT; actual amount fully validated by Drawing.cancelDraw())
+    //   Output[1] = CanceledRoundNFT (newly minted, validated by Drawing.cancelDraw())
+    //   Output[2] = RSC NFT (passed through unchanged, validated by RSC.cancelDraw())
+    //   Output[3] = JackpotPoolNFT (returns to this contract, BCH -= jpRefund, the "jackpot total at time of win" field updated accordingly, all other fields unchanged)
+    //   Output[4] = execution reward address (plain BCH, validated by Drawing.cancelDraw())
+    //   Output[5] = change BCH (validated by Drawing.cancelDraw())
+    //
+    //   This function applies only to an "accumulating" JackpotPoolNFT (winnerCount and claimCount both 0x00)
+    // ─────────────────────────────────────────────────────────────
+    function cancelDraw() {
+        require(this.activeInputIndex == 2, "JackpotPool contract must always be at input index 2");
+
+        // Verify input[0] is the DrawingNFT (minting, purpose 0x04)
+        bytes1 drawPurposeB,   bytes drawR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 drawRoundB = drawR1.split(2)[0];
+        require(drawPurposeB == 0x04);
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 16);
+        bytes5 drawCumulativeSalesB = tx.inputs[0].nftCommitment.slice(11, 16);
+
+        // Verify input[1] is the RSC NFT (minting, purpose 0x03)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x03);
+        require(tx.inputs[1].nftCommitment.length == 30);
+        bytes4 saleRateB = tx.inputs[1].nftCommitment.slice(24, 28);
+
+        // Parse the existing JP commitment (accumulating: winnerCount and claimCount both 0x00)
+        bytes1 jpPurposeB,          bytes jpR1 = tx.inputs[2].nftCommitment.split(1);
+        bytes2 jpAccumulateFromB,   bytes jpR2 = jpR1.split(2);
+        bytes jpR3 = jpR2.split(2)[1];
+        bytes4 jpWinNumB,           bytes jpR4 = jpR3.split(4);
+        bytes1 jpWinnerCountB,      bytes jpR5 = jpR4.split(1);
+        bytes1 jpRemainingClaimB,   bytes jpR6 = jpR5.split(1);
+        bytes  jpLastClaimTimeB = jpR6.split(8)[1];
+
+        // Verify input[2] is this JP NFT (minting, accumulating)
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[2].nftCommitment.length == 27);
+        require(jpPurposeB == 0x0a);
+        require(jpWinnerCountB == 0x00); // winnerCount == 0
+        require(jpRemainingClaimB == 0x00);
+
+        // Refund calculation (same formula as Drawing.cancelDraw())
+        // JP only actually receives 50% of this round's total ticket revenue in enterDrawingPhase()
+        // (20/30/50 split); the clawback must align with that same ratio, otherwise it would
+        // claw back an excess that doesn't belong to this round's old allocation
+        int ticketPriceSats = ticketPriceCents * 100_000_000 / int(saleRateB);
+        int roundRevenue = ticketPriceSats * int(drawCumulativeSalesB);
+        int platformCut  = roundRevenue * 20 / 100;
+        int fixedCut     = roundRevenue * 30 / 100;
+        int jpRefundWanted = roundRevenue - platformCut - fixedCut; // the remainder ensures this matches enterDrawingPhase's jackpotShare
+        int jpRefundCap = tx.inputs[2].value - 1000;
+        if (jpRefundWanted > jpRefundCap) {
+            jpRefundWanted = jpRefundCap;
+        }
+
+        // Output[3]: JackpotPoolNFT returns to this contract, BCH -= jpRefund, the "jackpot total at time of win" field updated to the new balance
+        int newJpValue = tx.inputs[2].value - jpRefundWanted;
+        bytes8 newTotalBCHB = toPaddedBytes(newJpValue, 8);
+        bytes27 newJpC = jpPurposeB + jpAccumulateFromB + drawRoundB + jpWinNumB + jpWinnerCountB + jpRemainingClaimB + newTotalBCHB + unsafe_bytes8(jpLastClaimTimeB);
+
+        require(tx.outputs[3].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[3].nftCommitment == newJpC);
+        require(tx.outputs[3].value == newJpValue);
+
+        require(tx.outputs.length == 6, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // collectDonation: sweeps up misdirected funds — anyone can trigger this, no permission needed.
+    //
+    // Transaction structure (Input[0] / Output[0] = this contract):
+    //   Input[0]    = JackpotPoolNFT (minting, accumulating, winnerCount == 0x00)
+    //   Input[1..N] = misdirected stray plain BCH (no NFT, N = tx.inputs.length - 2; all funds
+    //                 already sitting at this contract's address, unlocked via spendDonation())
+    //   Input[N+1]  = triggerer's plain BCH (required, covers the fee and funds the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT (returns to this contract, BCH += jpIncrease, the "jackpot total at time of win" field updated accordingly, all other fields unchanged)
+    //   Output[1] = execution reward + change BCH -> triggerer (required; = reward + whatever remains of Input[N+1] after fees)
+    //
+    //   Execution reward and jackpot share calculation:
+    //     jpIncrease = totalBCH * 90 / 100 (rounded down)
+    //     reward     = totalBCH − jpIncrease
+    //   and requires reward > 1,000 (dust floor)
+    // ─────────────────────────────────────────────────────────────
+    function collectDonation() {
+        require(this.activeInputIndex == 0, "JackpotPool contract must always be at input index 0");
+
+        // Parse the existing JP commitment
+        bytes1 jpPurposeB,          bytes jpR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 jpAccumulateFromB,   bytes jpR2 = jpR1.split(2);
+        bytes2 jpCurrentDrawRoundB, bytes jpR3 = jpR2.split(2);
+        bytes4 jpWinNumB,           bytes jpR4 = jpR3.split(4);
+        bytes1 jpWinnerCountB,      bytes jpR5 = jpR4.split(1);
+        bytes1 jpRemainingClaimB,   bytes jpR6 = jpR5.split(1);
+        bytes jpLastClaimTimeB = jpR6.split(8)[1];
+
+        // Verify input[0] is this contract's JP NFT (minting, accumulating)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+        require(jpWinnerCountB == 0x00);
+
+        // Verify each of Input[1..N] is pure plain BCH (no token, to prevent accidentally
+        // sweeping up and burning some other token), and sum them into totalBCH (these
+        // inputs are all stray misdirected funds already sitting at this contract's address)
+        int donationCount = tx.inputs.length - 2;
+        int totalBCH = 0;
+        require(donationCount >= 1, "Invalid donation UTXO count");
+        for (int i = 1; i <= donationCount; i++) {
+            require(tx.inputs[i].tokenCategory == 0x);
+            totalBCH = totalBCH + tx.inputs[i].value;
+        }
+
+        int jpIncrease = totalBCH * 90 / 100;
+        int reward = totalBCH - jpIncrease;
+        require(reward > 1000, "Reward too small to justify collection");
+
+        // Assemble the new JP commitment (the "jackpot total at time of win" field updated to the new balance, all other fields unchanged)
+        int newJpValue = tx.inputs[0].value + jpIncrease;
+        bytes8 newTotalBCHB = toPaddedBytes(newJpValue, 8);
+        bytes27 newJpC = jpPurposeB + jpAccumulateFromB + jpCurrentDrawRoundB + jpWinNumB + jpWinnerCountB + jpRemainingClaimB + newTotalBCHB + unsafe_bytes8(jpLastClaimTimeB);
+
+        // Output[0]: JackpotPoolNFT returns to this contract
+        require(tx.outputs[0].nftCommitment == newJpC);
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == newJpValue);
+
+        // Output[1]: execution reward + change BCH -> triggerer
+        require(tx.outputs[1].lockingBytecode == tx.inputs[donationCount + 1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs[1].value >= 1000);
+
+        require(tx.outputs.length == 2, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // playerDonation: player donation transaction — permissionless, anyone can initiate it,
+    // letting a player donate on their own initiative and optionally attach a public message.
+    // Merges the specified amount into the jackpot and mints a DonationMessageNFT recording
+    // this collection's round, amount, and message.
+    //
+    // Input[1..N] are always the donor's own wallet UTXOs, unlocked with an ordinary signature
+    // (P2PKH), not via spendDonation()
+    //
+    // Transaction structure (Input[0] / Output[0] = this contract):
+    //   Input[0]    = JackpotPoolNFT (minting, accumulating, winnerCount == 0x00)
+    //   Input[1..N] = donor's own plain BCH (no NFT, N = tx.inputs.length - 1; ordinary signature)
+    //
+    //   Output[0] = JackpotPoolNFT (returns to this contract, BCH += donationAmount, the "jackpot total at time of win" field updated accordingly, all other fields unchanged)
+    //   Output[1] = DonationMessageNFT (newly minted, recording this collection's round/amount/message hash, sent back to the JP contract address, kept permanently)
+    //   Output[2] = change BCH -> Input[1]'s address (required; covers whatever Input[1..N] exceeds donationAmount plus fees)
+    //   Output[3] = OP_RETURN, the full message text (fixed at 0x6a, 1 byte, when there is no message)
+    // ─────────────────────────────────────────────────────────────
+    function playerDonation(bytes messageLockingBytecode, int donationAmount) {
+        require(this.activeInputIndex == 0, "JackpotPool contract must always be at input index 0");
+
+        // Parse the existing JP commitment
+        bytes1 jpPurposeB,          bytes jpR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 jpAccumulateFromB,   bytes jpR2 = jpR1.split(2);
+        bytes2 jpCurrentDrawRoundB, bytes jpR3 = jpR2.split(2);
+        bytes4 jpWinNumB,           bytes jpR4 = jpR3.split(4);
+        bytes1 jpWinnerCountB,      bytes jpR5 = jpR4.split(1);
+        bytes1 jpRemainingClaimB,   bytes jpR6 = jpR5.split(1);
+        bytes jpLastClaimTimeB = jpR6.split(8)[1];
+
+        // Verify input[0] is this contract's JP NFT (minting, accumulating)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+        require(jpWinnerCountB == 0x00);
+
+        // Verify each of Input[1..N] is pure plain BCH and sum their actual value, so
+        // donationAmount is backed by real funds
+        int donationCount = tx.inputs.length - 1;
+        int donationTotal = 0;
+        require(donationCount >= 1, "Invalid donation UTXO count");
+        for (int i = 1; i <= donationCount; i++) {
+            require(tx.inputs[i].tokenCategory == 0x);
+            donationTotal = donationTotal + tx.inputs[i].value;
+        }
+
+        require(donationTotal >= donationAmount, "Donation inputs do not cover donationAmount");
+        // Verify donationAmount is under 2^39 (not the more intuitive 2^40 / 5-byte bit count —
+        // DonationMessageNFT's "total donation received this time" field is only 5 bytes, and
+        // OP_NUM2BIN still needs to reserve 1 sign bit to encode a positive number correctly, so
+        // the largest positive integer 5 bytes can safely hold is actually 2^39 − 1, not 2^40 − 1)
+        require(donationAmount < 549755813888); // 2^39
+        // Verify donationAmount is not below the estimated fee of 5,000 sats
+        require(donationAmount >= 5000);
+
+        // Verify the message's OP_RETURN lockingBytecode (1-200 bytes, must start with 0x6a)
+        require(messageLockingBytecode.length >= 1 && messageLockingBytecode.length <= 200);
+        require(messageLockingBytecode.split(1)[0] == 0x6a);
+
+        // Assemble the new JP commitment (the "jackpot total at time of win" field updated to the new balance, all other fields unchanged)
+        int newJpValue = tx.inputs[0].value + donationAmount;
+        bytes8 newTotalBCHB = toPaddedBytes(newJpValue, 8);
+        bytes27 newJpC = jpPurposeB + jpAccumulateFromB + jpCurrentDrawRoundB + jpWinNumB + jpWinnerCountB + jpRemainingClaimB + newTotalBCHB + unsafe_bytes8(jpLastClaimTimeB);
+
+        // Output[0]: JackpotPoolNFT returns to this contract
+        require(tx.outputs[0].nftCommitment == newJpC);
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == newJpValue);
+
+        // DonationMessageNFT commitment (40 bytes, LE):
+        //   [0]     purpose: 0x08
+        //   [1-2]   round of occurrence: LE uint16 (Input[0]'s currentDrawRound + 1)
+        //   [3-7]   total donation received this time: LE uint40 (5 bytes)
+        //   [8-39]  message hash: full 32 bytes of sha256(messageLockingBytecode)
+        bytes32 messageHashB = sha256(messageLockingBytecode);
+        bytes2 dmDonationRoundB = toPaddedBytes(int(jpCurrentDrawRoundB) + 1, 2);
+        bytes40 dmC = 0x08 + dmDonationRoundB + toPaddedBytes(donationAmount, 5) + messageHashB;
+
+        // Output[1]: DonationMessageNFT (newly minted, sent back to the JP contract address, kept permanently, never burned)
+        require(tx.outputs[1].nftCommitment == dmC);
+        require(tx.outputs[1].tokenCategory == authNftCategoryId);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[1].value == 1000);
+
+        // Output[2]: change BCH -> Input[1]'s address (required; amount = whatever Input[1..N]
+        // exceeds donationAmount minus the actual fee, floating and not pinned to an exact value, hence the lower bound)
+        require(tx.outputs[2].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[2].value >= 1000);
+
+        // Output[3]: OP_RETURN, the full message text (fixed blank value 0x6a when there is no message)
+        require(tx.outputs[3].lockingBytecode == messageLockingBytecode);
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].value == 0);
+
+        require(tx.outputs.length == 4, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // spendDonation: authorizes unlocking stray plain BCH donation UTXOs sitting at this same
+    // contract address, holding no NFT (same address collectDonation() sweeps; part of the same
+    // transaction, one of Input[1..N])
+    //
+    // Transaction structure (Input[1..N] = misdirected stray plain BCH):
+    //   Input[0]    = JackpotPoolNFT (minting, accumulating, winnerCount == 0x00)
+    //   Input[1..N] = misdirected stray plain BCH (no NFT, N = tx.inputs.length - 2; all funds
+    //                 already sitting at this contract's address, unlocked via spendDonation())
+    //   Input[N+1]  = triggerer's plain BCH (required, covers the fee and funds the execution reward)
+    //
+    //   Output[0] = JackpotPoolNFT (returns to this contract, BCH += jpIncrease, the "jackpot total at time of win" field updated accordingly, all other fields unchanged)
+    //   Output[1] = execution reward + change BCH -> triggerer (required; = reward + whatever remains of Input[N+1] after fees)
+    // ─────────────────────────────────────────────────────────────
+    function spendDonation() {
+        require(tx.inputs[this.activeInputIndex].tokenCategory == 0x);
+
+        bytes1 jpPurposeB       = tx.inputs[0].nftCommitment.slice(0, 1);
+        bytes1 jpWinnerCountB   = tx.inputs[0].nftCommitment.slice(9, 10);
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(jpPurposeB == 0x0a);
+        require(tx.inputs[0].nftCommitment.length == 27);
+        require(jpWinnerCountB == 0x00);
+
+        // Output[0]: JackpotPoolNFT returns to this contract
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.outputs[0].nftCommitment.split(1)[0] == 0x0a);
+        require(tx.outputs[0].nftCommitment.length == 27);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value >= tx.inputs[0].value);
+
+        // Output[1]: change BCH -> triggerer (required)
+        require(tx.outputs[1].tokenCategory == 0x);
+        require(tx.outputs[1].value >= 1000);
+
+        require(tx.outputs.length == 2, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // sweepAccumulatingAfterGameOver: reclaims an accumulating JackpotPoolNFT; permissionless,
+    // anyone can trigger this. jackpotTo is read directly from the same transaction's
+    // RoundSwitchControlNFT current drawingRound, not accepted as a caller-supplied parameter.
+    // Warning: this function must only be called after all transitional rounds have already
+    // completed through the normal flow.
+    //
+    // Transaction structure:
+    //   Input[0]  = this contract's JackpotPoolNFT (minting, winnerCount == 0; burned)
+    //   Input[1]  = GameOverNFT (any shard address, read-only)
+    //   Input[2]  = RoundSwitchControlNFT (read-only, calls RoundSwitchControl.useForJackpotSweep())
+    //   Input[3+] = triggerer's plain BCH (tops up the fee when the execution reward falls short, same convention as enterDrawingPhase())
+    //
+    //   Output[0] = GameOverNFT (passed through unchanged; since Input[0]'s JP is burned with no
+    //               corresponding output, every output after this one shifts forward by one index,
+    //               see the comment in RoundShardAuth.useForSweepAccumulating())
+    //   Output[1] = RoundSwitchControlNFT (passed through unchanged)
+    //   Output[2] = FixedPrizePool plain BCH
+    //   Output[3] = JackpotClaimRangeNFT (newly minted, sent to the FixedPrizePool address)
+    //   Output[4] = execution reward address (plain BCH, fixed 1 USD, destination not validated)
+    //   Output[5] = change BCH
+    // ─────────────────────────────────────────────────────────────
+    function sweepAccumulatingAfterGameOver() {
+        require(this.activeInputIndex == 0, "JackpotPool contract must always be at input index 0");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 27);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x0a);
+        require(tx.inputs[0].nftCommitment.slice(9, 10) == 0x00, "Only accumulating (winnerCount == 0) pools can be swept here");
+        bytes2 accumulateFromB = tx.inputs[0].nftCommitment.slice(1, 3);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[0].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[0].value == tx.inputs[1].value);
+
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[2].nftCommitment.length == 30);
+        require(tx.inputs[2].nftCommitment.slice(0, 1) == 0x03);
+        bytes2 drawingRoundB = tx.inputs[2].nftCommitment.slice(1, 3);
+        bytes4 stagedRateB = tx.inputs[2].nftCommitment.slice(24, 28);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[1].value == tx.inputs[2].value);
+
+        // jackpotTo equals the drawingRound at the moment of the call (see the comment above; not a caller-supplied parameter)
+        int stagedRateI = int(stagedRateB);
+        require(stagedRateI > 0);
+        int executeShare = 10_000_000_000 / stagedRateI;
+
+        int leftover = tx.inputs[0].value - 1000 - executeShare;
+        if (leftover < 0) {
+            leftover = 0;
+        }
+
+        require(tx.outputs[2].value == 1000 + leftover);
+        require(tx.outputs[2].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[2].tokenCategory == 0x);
+
+        bytes jackpotClaimRangeC = 0x0c + accumulateFromB + drawingRoundB;
+        require(tx.outputs[3].nftCommitment == jackpotClaimRangeC);
+        require(tx.outputs[3].tokenCategory == authNftCategoryId);
+        require(tx.outputs[3].lockingBytecode == fixedPrizePoolLockingBytecode);
+        require(tx.outputs[3].value == 1000);
+
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].value >= executeShare);
+
+        require(tx.outputs[5].tokenCategory == 0x);
+        require(tx.outputs[5].value >= 1000);
+
+        require(tx.outputs.length == 6, "Invalid number of outputs");
+    }
+
+
+    // ─────────────────────────────────────────────────────────────
+    // endGame:
+    // once the GameOverNFT exists, the game has ended and the system enters end-game mode.
+    // The validation logic only proves that the game has truly ended and that the caller is
+    // truly the admin; since JP holds prize funds, its endGame() is restricted to run only
+    // 90 days after game-over.
+    // The contract only checks that the adminNftCategoryId and gameOverNftCategoryId NFTs are
+    // passed through unchanged; everything else is left entirely to the admin's discretion.
+    //
+    // Transaction structure:
+    //   Input[0]  = adminNftCategoryId NFT (held by admin, P2PKH, unlocked by signature)
+    //   Input[1]  = GameOverNFT (any shard address, read-only, unlocked via RoundShardAuth.useGameOverNFT())
+    //
+    //   Output[0]  = adminNftCategoryId NFT (passed through unchanged, back to admin)
+    //   Output[1]  = GameOverNFT (passed through unchanged)
+    // ─────────────────────────────────────────────────────────────
+    function endGame() {
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        bytes8 gameOverConfirmedTimeB = tx.inputs[1].nftCommitment.slice(1, 9);
+
+        require(tx.time >= int(gameOverConfirmedTimeB) + 90 days, "Must wait 3 months after game over confirmed");
+
+        // If this call spends this contract's own JackpotPoolNFT, it must be in the
+        // "won, pending claim" state (winnerCount > 0) — "accumulating" (winnerCount == 0)
+        // is always rejected here
+        int myIdx = this.activeInputIndex;
+        if (tx.inputs[myIdx].tokenCategory == authNftCategoryId + 0x02) {
+            require(tx.inputs[myIdx].nftCommitment.length == 27);
+            require(tx.inputs[myIdx].nftCommitment.slice(0, 1) == 0x0a);
+            require(tx.inputs[myIdx].nftCommitment.slice(9, 10) != 0x00, "Accumulating pool must go through sweepAccumulatingAfterGameOver()");
+        }
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+}

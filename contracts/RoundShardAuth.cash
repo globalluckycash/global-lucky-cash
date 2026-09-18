@@ -1,0 +1,563 @@
+pragma cashscript ^0.13.1;
+
+// RoundShardAuthNFT — one of 64 shards, holds the accumulated ticket revenue (BCH) for the current round
+//
+// Commitment layout (23 bytes):
+//   [0]     purpose: 0x01
+//   [1-2]   sellingRound: LE uint16
+//   [3-4]   shardId: LE uint16
+//   [5-8]   shardSalesCount: LE uint32
+//   [9-12]  exchangeRate: LE uint32 (BCH/USD rate, i.e. the integer USD price of BCH; copied from the
+//           corresponding ShardSettlementNFT's nextSellingRate field at settle() time, written from the
+//           oracle Data Content at draw time)
+//   [13]    status: 0x00 (reserved)
+//   [14-21] lastSoldTime: LE int64 (8 bytes, tx.time of this shard's most recent sellTicket() call ever,
+//           a monotonically non-decreasing ratchet, carried forward unchanged into the next round by
+//           settle(), never reset to zero)
+//   [22]    gameOverFlag: 0x00 = operating normally; 0x01 = game-over declared, copied by settle() from
+//           the (pending-settle) ShardSettlementNFT it consumes; sellTicket() requires this field to be
+//           0x00 before allowing further ticket sales
+//
+// ShardSettlementNFT commitment layout (31 bytes):
+//   [0]     purpose: 0x09
+//   [1]     phase: 0x00 (pending-settle) / 0x01 (pending-aggregate)
+//   [2-3]   round: LE uint16 (pending-settle = nextSellingRound; pending-aggregate = settlementRound)
+//   [4-5]   shardId: LE uint16
+//   [6-9]   nextSellingRate: LE uint32
+//   [10-17] sellingCutoffTime: LE int64 (8 bytes)
+//   [18-21] shardSalesCount: LE uint32
+//   [22-29] lastSoldTime: LE int64 (8 bytes)
+//   [30]    gameOverFlag: written by aggregate()/useForAggregate() in the pending-settle state (copied
+//           from RSC); written by settle() in the pending-aggregate state (copied from the RSA it
+//           consumes; unused by any logic in that state)
+//
+// TicketNFT commitment layout (14 bytes, BE, with 0xff visual separators):
+//   Each NFT represents exactly 1 ticket (1 number set)
+//   [0-1]  round: BE uint16
+//   [2]    ff (separator)
+//   [3-6]  lotteryNumber: [n1, n2, n3, s] (1 byte each)
+//   [7]    ff (separator)
+//   [8-11] purchaseRate: BE uint32
+//   [12]   ff (separator)
+//   [13]   claimStatus: 0x00
+//
+// GameOverNFT commitment layout (9 bytes, none capability, purpose 0x0B):
+//   [0]   purpose: 0x0B
+//   [1-8] confirmedTime: LE int64 (8 bytes, copied from this shard's RoundShardAuthNFT lastSoldTime at mint time)
+
+contract RoundShardAuth(bytes32 authNftCategoryId, bytes32 adminNftCategoryId, bytes2 shardId, int ticketPriceCents) {
+
+    // ─────────────────────────────────────────────────────────────
+    // sellTicket: player buys tickets
+    // RoundShardAuth.cash (this contract) is the primary validating contract — review carefully
+    //
+    // Let N = (tx.outputs.length - 2) / 2 (number of tickets purchased, N >= 1, tx.outputs.length is even)
+    //
+    // Transaction structure:
+    //   Input[0]       = this contract's RSA NFT (minting)
+    //   Input[1..N]    = NumberSalesNFT x N (mutable, one per number set)
+    //   Input[N+1+]    = player's plain BCH UTXO (payment)
+    //
+    //   Output[0]        = RSA NFT (shardSalesCount+N, lastSoldTime=tx.time, BCH accumulated)
+    //   Output[1..N]     = NumberSalesNFT x N (odd/even sales count updated, fully validated by this contract)
+    //   Output[N+1..2N]  = TicketNFT x N (minted, issued to the player)
+    //   Output[2N+1]     = BCH change (contract enforces its presence; tx.outputs.length is fixed at 2N+2)
+    // ─────────────────────────────────────────────────────────────
+    function sellTicket() {
+        require(this.activeInputIndex == 0, "RSA contract must always be at input index 0");
+
+        // Verify input[0] is the RSA NFT (minting capability)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 23);
+
+        // Sequentially split-parse the RSA commitment (23 bytes)
+        bytes1 rsaPurposeB,     bytes rsaR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 rsaRoundB,       bytes rsaR2 = rsaR1.split(2);
+        bytes2 rsaShardIdB,     bytes rsaR3 = rsaR2.split(2);
+        bytes4 rsaSalesCountB,  bytes rsaR4 = rsaR3.split(4);
+        bytes4 rsaRateB,        bytes rsaR5 = rsaR4.split(4);
+        bytes1 rsaStatusB,      bytes rsaR6 = rsaR5.split(1);
+        bytes8 rsaLastSoldTimeB, bytes rsaGameOverFlagB = rsaR6.split(8);
+
+        require(rsaPurposeB == 0x01);
+        require(rsaShardIdB == shardId, "RSA commitment shardId must match this contract's shardId");
+        require(rsaGameOverFlagB == 0x00, "Game has ended, no more tickets");
+
+        int rsaRound = int(rsaRoundB);
+
+        bytes1 rsaRoundL, bytes rsaRoundH = rsaRoundB.split(1);
+        bytes2 rsaRoundBE = unsafe_bytes1(rsaRoundH) +rsaRoundL;
+
+        bytes1 rsaRateL1, bytes rsaRateR1 = rsaRateB.split(1);
+        bytes1 rsaRateL2, bytes rsaRateR2 = rsaRateR1.split(1);
+        bytes1 rsaRateL3, bytes rsaRateL4 = rsaRateR2.split(1);
+        bytes4 rsaRateBE = unsafe_bytes1(rsaRateL4) + rsaRateL3 + rsaRateL2 + rsaRateL1;
+
+        int ticketQuantity = (tx.outputs.length - 2) / 2;
+        require(ticketQuantity >= 1 && ticketQuantity <= 10);
+
+        // Per-shard sales cap: prevents a single shard from being perpetually front-run on sales and never reaching settlement
+        require(int(rsaSalesCountB) + ticketQuantity <= 100000, "Shard sales cap reached");
+
+        // lastSoldTime ratchet: this field must be monotonically non-decreasing
+        require(tx.time >= int(rsaLastSoldTimeB), "sellTicket time must not precede last sold time");
+
+        int plainBchInputIdx = ticketQuantity + 1;
+        for (int i = 1; i <= ticketQuantity; i++) {
+            // Sequentially split-parse the NumberSalesNFT commitment (17 bytes)
+            bytes1 nsPurposeB,    bytes nsR1 = tx.inputs[i].nftCommitment.split(1);
+            bytes4 nsLotteryNumB, bytes nsR2 = nsR1.split(4);
+            bytes2 nsOddRoundB,   bytes nsR3 = nsR2.split(2);
+            bytes4 nsOddCountB,   bytes nsR4 = nsR3.split(4);
+            bytes2 nsEvenRoundB,  bytes nsR5 = nsR4.split(2);
+            bytes4 nsEvenCountB = unsafe_bytes4(nsR5);
+
+            // Verify input[1..N] are NumberSalesNFT (mutable capability)
+            require(tx.inputs[i].tokenCategory == authNftCategoryId + 0x01);
+            require(tx.inputs[i].nftCommitment.length == 17);
+            require(nsPurposeB == 0x02);
+
+            // ── Output[1..N]: NumberSalesNFT (fully computes and validates the sales-count update, keyed on rsaRound's parity) ──
+            bytes newNsOddRoundB  = nsOddRoundB;
+            bytes newNsOddCountB  = nsOddCountB;
+            bytes newNsEvenRoundB = nsEvenRoundB;
+            bytes newNsEvenCountB = nsEvenCountB;
+
+            if (rsaRound % 2 == 1) {
+                if (int(nsOddRoundB) == rsaRound) {
+                    newNsOddCountB = toPaddedBytes(int(nsOddCountB) + 1, 4);
+                } else {
+                    newNsOddRoundB = rsaRoundB;
+                    newNsOddCountB = toPaddedBytes(1, 4);
+                }
+            } else {
+                if (int(nsEvenRoundB) == rsaRound) {
+                    newNsEvenCountB = toPaddedBytes(int(nsEvenCountB) + 1, 4);
+                } else {
+                    newNsEvenRoundB = rsaRoundB;
+                    newNsEvenCountB = toPaddedBytes(1, 4);
+                }
+            }
+
+            bytes newNsC = nsPurposeB + nsLotteryNumB + newNsOddRoundB + newNsOddCountB + newNsEvenRoundB + newNsEvenCountB;
+
+            require(tx.outputs[i].lockingBytecode == tx.inputs[i].lockingBytecode, "Invalid NS NFT locking bytecode");
+            require(tx.outputs[i].tokenCategory == tx.inputs[i].tokenCategory, "Invalid NS NFT token category");
+            require(tx.outputs[i].value == 1000, "Invalid NS NFT value");
+            require(tx.outputs[i].nftCommitment == newNsC, "Invalid NS NFT commitment");
+
+            // TicketNFT commitment (14 bytes, BE, with ff separators):
+            // [round BE(2)][ff][n1 n2 n3 s(4)][ff][purchaseRate BE(4)][ff][claimStatus(1)]
+            bytes ticketC = rsaRoundBE + 0xff + nsLotteryNumB + 0xff + rsaRateBE + 0xff + 0x00;
+
+            // ── Output[N+1..2N]: TicketNFT (minted by RSA's minting capability) ──
+            int k = ticketQuantity + i;
+            require(tx.outputs[k].nftCommitment == ticketC);
+            require(tx.outputs[k].value == 1000); // dust
+            require(tx.outputs[k].tokenCategory == authNftCategoryId); // immutable
+
+            // P2PKH player (lockingBytecode 25 bytes): TicketNFT is forced to be sent back to the player's address
+            // Contract payer (e.g. TicketDeposit, P2SH 23 bytes): that contract validates the TicketNFT destination itself
+            if (tx.inputs[plainBchInputIdx].lockingBytecode.length == 25) {
+                require(tx.outputs[k].lockingBytecode == tx.inputs[plainBchInputIdx].lockingBytecode);
+            }
+        }
+
+        int rsaRateI = int(rsaRateB);
+        require(rsaRateI > 0);
+
+        // rsaRateI is the raw oracle Data Content value, already scaled by 100 (ATTESTATION_SCALING = 100, i.e. USD/BCH x 100)
+        // ticketPrice = ticketPriceCents * 100,000,000 / rsaRateI (satoshis, equivalent to ticketPriceCents in USD cents)
+        int ticketPrice = ticketPriceCents * 100_000_000 / rsaRateI;
+
+        // ── Output[0]: RSA NFT update (lastSoldTime overwritten with tx.locktime, forming a monotonically non-decreasing ratchet) ──
+        bytes newRsaSalesCountB = toPaddedBytes(int(rsaSalesCountB) + ticketQuantity, 4);
+        // tx.time can only be used in a CHECKLOCKTIMEVERIFY comparison (the require() above); its value cannot be
+        // read directly. Writing it into the commitment must instead read tx.locktime (which reads the same
+        // nLockTime field as tx.time)
+        bytes8 newLastSoldTimeB = toPaddedBytes(tx.locktime, 8);
+        bytes newRsaC = rsaPurposeB + rsaRoundB + rsaShardIdB + newRsaSalesCountB + rsaRateB + rsaStatusB + newLastSoldTimeB + rsaGameOverFlagB;
+
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode, "Invalid RSA NFT locking bytecode");
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02, "Invalid RSA NFT token category");
+        require(tx.outputs[0].value == tx.inputs[0].value + ticketPrice * ticketQuantity, "Invalid RSA NFT value");
+        require(tx.outputs[0].nftCommitment == newRsaC, "Invalid RSA NFT commitment");
+
+        //   Output[2N+1] = BCH change (contract enforces its presence; tx.outputs.length is fixed at 2N+2)
+        int changeIdx = ticketQuantity * 2 + 1;
+
+        // P2PKH player: change is forced to be sent back to the player's address
+        // Contract payer (e.g. TicketDeposit, P2SH 23 bytes): that contract validates the change destination itself
+        if (tx.inputs[plainBchInputIdx].lockingBytecode.length == 25) {
+            require(tx.outputs[changeIdx].lockingBytecode == tx.inputs[plainBchInputIdx].lockingBytecode, "Invalid BCH change output - should send change to original player");
+        }
+        require(tx.outputs[changeIdx].value >= 1000, "Invalid BCH change output - should have at least 1000 satoshis");
+        require(tx.outputs[changeIdx].tokenCategory == 0x, "Invalid BCH change output - should not hold any tokens");
+        require(tx.outputs.length == (changeIdx + 1), "Invalid number of outputs - should have equal amount of outputs as ticket quantity *2 + 2");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // settle: settlement transaction, executed independently per shard, can run in parallel
+    // RoundShardAuth.cash (this contract) is the primary validating contract — review carefully
+    //
+    // Transaction structure (Input[0,1] / Output[0,1] = this contract, same address):
+    //   Input[0] = RoundShardAuthNFT (this shard, holding the round's accumulated ticket revenue)
+    //   Input[1] = ShardSettlementNFT (this shard's settlement ticket, pending-settle state)
+    //   Input[2] = optional escape-valve plain BCH (only needed if Input[1]'s allocation isn't enough
+    //              to cover fees; must carry no token; only in this case does the transaction builder
+    //              need to sign it themselves — normally not needed at all)
+    //
+    //   Output[0] = RoundShardAuthNFT: round/exchangeRate replaced with Input[1]'s nextSellingRound/
+    //               nextSellingRate, shard sales count reset to zero, lastSoldTime unchanged (carried
+    //               forward as-is, not reset); BCH reduced to dust
+    //   Output[1] = ShardSettlementNFT: transitions to pending-aggregate state (phase = 0x01) — round
+    //               becomes Input[0]'s old round (the settlement round), shard sales count = Input[0]'s
+    //               old sales count, shard lastSoldTime = Input[0]'s lastSoldTime; BCH value =
+    //               Input[0].value (this shard's entire ticket revenue + its own new dust); the
+    //               execution reward carried by Input[1] is not folded into this output — see Output[2]
+    //   Output[2] = execution reward -> any address specified by the transaction builder (destination
+    //               not validated by the contract); only the dust floor is enforced, not an exact
+    //               amount — the actual amount = Input[1]'s pre-funded reward net of its own dust,
+    //               minus this transaction's miner fee
+    // ─────────────────────────────────────────────────────────────
+    function settle() {
+        require(this.activeInputIndex == 0, "RSA contract must always be at input index 0");
+
+        // Input[2] (escape valve, see the Output[2] note above) is optional, needed only when Input[1]'s
+        // pre-funded allocation isn't enough to cover fees; at most one such input is allowed, and it must be
+        // plain BCH carrying no token, to prevent smuggling in an unexpected NFT
+        require(tx.inputs.length == 2 || tx.inputs.length == 3, "Invalid number of inputs");
+        if (tx.inputs.length == 3) {
+            require(tx.inputs[2].tokenCategory == 0x, "Input[2] must be plain BCH, not an NFT");
+        }
+
+        // Parse the RSA commitment (23 bytes)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 23);
+
+        bytes1 rsaPurposeB,     bytes rsaR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 rsaRoundB,       bytes rsaR2 = rsaR1.split(2);
+        bytes2 rsaShardIdB,     bytes rsaR3 = rsaR2.split(2);
+        bytes4 rsaSalesCountB,  bytes rsaR4 = rsaR3.split(4);
+        bytes4 exchangeRateB,   bytes rsaR5 = rsaR4.split(4);
+        bytes1 rsaStatusB,      bytes rsaR6 = rsaR5.split(1);
+        bytes8 rsaLastSoldTimeB, bytes rsaGameOverFlagB = rsaR6.split(8);
+
+        require(rsaPurposeB == 0x01);
+        require(rsaShardIdB == shardId, "RSA commitment shardId must match this contract's shardId");
+
+        // Parse the ShardSettlementNFT commitment (31 bytes, same shard address)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 31);
+
+        bytes1 ssPurposeB,    bytes ssR1 = tx.inputs[1].nftCommitment.split(1);
+        bytes1 ssPhaseB,      bytes ssR2 = ssR1.split(1);
+        bytes2 ssRoundB,      bytes ssR3 = ssR2.split(2);
+        bytes2 ssShardIdB,    bytes ssR4 = ssR3.split(2);
+        bytes4 ssNextRateB,   bytes ssR5 = ssR4.split(4);
+        bytes8 ssCutoffTimeB, bytes ssR6 = ssR5.split(8);
+        bytes1 ssGameOverFlagB = unsafe_bytes1(ssR6.split(12)[1]);
+        // 跳過 shardSalesCount／分片最後售出時間（待結算狀態下固定為 0，settle() 改寫入
+        // RSA 自己的舊售出票數／最後售出時間，見下方 newSsC，不需要讀 SS 上的這兩個欄位）
+
+        require(ssPurposeB == 0x09);
+        require(ssPhaseB == 0x00, "ShardSettlementNFT must be in pending-settle phase");
+        require(ssShardIdB == shardId, "SS commitment shardId must match this contract's shardId");
+        require(int(rsaRoundB) + 1 == int(ssRoundB), "SS nextSellingRound must follow RSA's current round");
+
+        require(rsaGameOverFlagB == 0x00, "Game has ended, no more tickets");
+
+        // 觸發門檻：本分片目前這一輪的截止售票時間已到（讀自 SS，不需要參照 RSC）
+        require(tx.time >= int(ssCutoffTimeB));
+
+        // Output[0]: RoundShardAuthNFT 更新（推進到下一銷售輪）；gameOverFlag 複製自本次消費的
+        // （待結算狀態）ShardSettlementNFT
+        bytes newRsaC = rsaPurposeB + ssRoundB + rsaShardIdB + 0x00000000 + ssNextRateB + rsaStatusB + rsaLastSoldTimeB + ssGameOverFlagB;
+
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode, "Invalid RSA NFT locking bytecode");
+        require(tx.outputs[0].tokenCategory == authNftCategoryId + 0x02, "Invalid RSA NFT token category");
+        require(tx.outputs[0].value == 1000, "Invalid RSA NFT value");
+        require(tx.outputs[0].nftCommitment == newRsaC, "Invalid RSA NFT commitment");
+
+        // Output[1]: ShardSettlementNFT 轉為待彙整狀態；本分片全部票款（Input[0] 扣除自身新
+        // dust 後的餘額）轉入本 NFT，Input[1] 原本攜帶的撥補獎勵不併入本輸出，改進 Output[2]；
+        // gameOverFlag 複製自本次消費的 RSA（待彙整狀態下不被任何邏輯使用）
+        bytes newSsC = ssPurposeB + 0x01 + rsaRoundB + ssShardIdB + exchangeRateB + ssCutoffTimeB + rsaSalesCountB + rsaLastSoldTimeB + rsaGameOverFlagB;
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode, "Invalid SS NFT locking bytecode");
+        require(tx.outputs[1].tokenCategory == authNftCategoryId + 0x02, "Invalid SS NFT token category");
+        require(tx.outputs[1].value == tx.inputs[0].value, "Invalid SS NFT value");
+        require(tx.outputs[1].nftCommitment == newSsC, "Invalid SS NFT commitment");
+
+        // Output[2]: 執行獎勵 → 交易建立者指定的任意地址（不驗證目的地）；只驗證
+        // dust 下限，不要求精確金額——實際金額 = Input[1] 扣除自身 dust 後的撥補獎勵，再扣掉本筆
+        // 交易的礦工費（無獨立的找零/手續費 input，礦工費由此 output 吸收，等同其餘交易「找零」角色）
+        require(tx.outputs[2].value >= 1000, "Invalid reward output value");
+        require(tx.outputs[2].tokenCategory == 0x, "Invalid reward output - should not hold any tokens");
+
+        require(tx.outputs.length == 3, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useForSettle: 結算交易中解鎖本分片的 ShardSettlementNFT（Input[1]）
+    // 主要驗證在 settle()，這裡僅做輕量驗證
+    //
+    // 交易結構：見上方 settle() 註解
+    // ─────────────────────────────────────────────────────────────
+    function useForSettle() {
+        require(this.activeInputIndex == 1, "SS contract must be at input index 1 during settle()");
+
+        // 驗證 input[0] 為 RoundShardAuthNFT（minting，同分片，purpose 0x01）
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 23);
+        require(tx.inputs[0].nftCommitment.split(1)[0] == 0x01);
+        require(tx.inputs[0].nftCommitment.slice(3, 5) == shardId, "RSA commitment shardId must match this contract's shardId");
+
+        // 驗證本合約為 ShardSettlementNFT（minting，purpose 0x09）
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 31);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x09);
+        require(tx.inputs[1].nftCommitment.slice(4, 6) == shardId, "SS commitment shardId must match this contract's shardId");
+
+        // Output[1]: 本 ShardSettlementNFT（commitment 由 settle() 完整驗證，此處驗證基本欄位）
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode, "Invalid SS NFT locking bytecode");
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory, "Invalid SS NFT token category");
+        require(tx.outputs[1].nftCommitment.split(1)[0] == 0x09);
+        require(tx.outputs[1].nftCommitment.length == 31);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useForAggregate: 彙整交易中解鎖本分片的 ShardSettlementNFT（Input[1..32] 之一，
+    // 每批固定 32 片）
+    // 主要驗證在 RoundSwitchControl.aggregate()（Input[0]），purpose/phase/round
+    // 驗證與新 commitment 的重建比較放在這裡做
+    //
+    // 交易結構：見 RoundSwitchControl.cash aggregate() 上方註解
+    // ─────────────────────────────────────────────────────────────
+    function useForAggregate() {
+        int myIdx = this.activeInputIndex;
+        require(myIdx >= 1 && myIdx <= 32, "SS contract must be at input index 1-32 during aggregate()");
+
+        // 解析 RSC commitment（30 bytes，Input[0]）取 round／stagedRate／gameOverFlag；
+        // aggregateBatchFlag（尾端新增的第 30 個 byte）與本函式無關，split 出來即丟棄
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 30);
+        bytes1 rscPurposeB, bytes rscR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 rscRoundB,   bytes rscR2 = rscR1.split(2);
+        bytes rscR3 = rscR2.split(21)[1]; // 跳過 cutoffTime(8)+cumulativeSales(5)+lastAggregateTime(8)，剩 stagedRate(4)+gameOverFlag(1)+aggregateBatchFlag(1)
+        bytes4 rscStagedRateB = rscR3.split(4)[0];
+        // aggregateBatchFlag（split 出來的第 2 個 byte）本函式不需要，直接丟棄不留名
+        bytes1 rscGameOverFlagB = unsafe_bytes1(rscR3.split(4)[1].split(1)[0]);
+        require(rscPurposeB == 0x03);
+
+        // Parse the ConfigNFT commitment (19 bytes, Input[33] = 1 RSC + 32 shards) for GENESIS_TIME/
+        // PROD_ROUND_PERIOD; the trailing settledRate field (see the comment in
+        // RoundSwitchControl.cash useConfigForAggregate()) is not needed here and is not parsed
+        require(tx.inputs[33].tokenCategory == authNftCategoryId);
+        require(tx.inputs[33].nftCommitment.split(1)[0] == 0x06);
+        require(tx.inputs[33].nftCommitment.length == 19);
+        bytes1 cfgPurposeB,     bytes cfgR1 = tx.inputs[33].nftCommitment.split(1);
+        bytes8 cfgGenesisTimeB, bytes cfgR2 = cfgR1.split(8);
+        bytes4 cfgRoundPeriodB = cfgR2.split(4)[0];
+        require(cfgPurposeB == 0x06);
+
+        // 再下一波結算用的乾淨參數：輪次 = 結算輪 + 2，銷售截止時間 = 結算輪 + 1 那一輪的截止售票時間
+        bytes2 newSsRoundB = toPaddedBytes(int(rscRoundB) + 2, 2);
+        bytes8 newSsCutoffTimeB = toPaddedBytes(int(cfgGenesisTimeB) + (int(rscRoundB) + 1) * int(cfgRoundPeriodB), 8);
+
+        // settle() 手續費及執行獎勵預留（固定 6000 sats）
+        int settleFeeReserve = 6000;
+        int rscStagedRateI = int(rscStagedRateB);
+        require(rscStagedRateI > 0);
+        // rscStagedRateI 已放大 100 倍（ATTESTATION_SCALING），需一併還原才能算出 1 USD 等值 sats
+        int oneUsdSats = 10_000_000_000 / rscStagedRateI;
+        int perShardSettle = (oneUsdSats - (oneUsdSats % 64)) / 64;
+
+        // 驗證本合約為 ShardSettlementNFT（minting，待彙整狀態，31 bytes）
+        require(tx.inputs[myIdx].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[myIdx].nftCommitment.length == 31);
+
+        bytes1 ssPurposeB, bytes ssR1 = tx.inputs[myIdx].nftCommitment.split(1);
+        bytes1 ssPhaseB,   bytes ssR2 = ssR1.split(1);
+        bytes2 ssRoundB,   bytes ssR3 = ssR2.split(2);
+        bytes2 ssShardIdB = ssR3.split(2)[0];
+
+        require(ssPurposeB == 0x09);
+        require(ssPhaseB == 0x01, "ShardSettlementNFT must be in pending-aggregate phase");
+        require(ssRoundB == rscRoundB, "ShardSettlementNFT round must match RSC's settlement round");
+        require(ssShardIdB == shardId, "SS commitment shardId must match this contract's shardId");
+
+        // Output[myIdx]: 本 ShardSettlementNFT 重置回待結算狀態，BCH value 帶上下一波 settle()
+        // 的手續費預留 + 執行獎勵預撥款，兩者皆無條件撥給（settle() 一定給執行獎勵，見上方
+        // perShardSettle/settleFeeReserve）；gameOverFlag 複製自 RSC
+        bytes newSsC = ssPurposeB + 0x00 + newSsRoundB + ssShardIdB + rscStagedRateB + newSsCutoffTimeB + 0x00000000 + 0x0000000000000000 + rscGameOverFlagB;
+
+        require(tx.outputs[myIdx].lockingBytecode == tx.inputs[myIdx].lockingBytecode, "Invalid SS NFT locking bytecode");
+        require(tx.outputs[myIdx].tokenCategory == tx.inputs[myIdx].tokenCategory, "Invalid SS NFT token category");
+        require(tx.outputs[myIdx].value == 1000 + settleFeeReserve + perShardSettle, "Invalid SS NFT value");
+        require(tx.outputs[myIdx].nftCommitment == newSsC, "Invalid SS NFT commitment");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // mintGameOverNFT: 分片自證停售，每個分片各自獨立呼叫，不需要其他 63 個分片配合。
+    // 只檢查兩者 gameOverFlag 皆為 0x01，不比對輪次欄位。
+    //
+    // 交易結構：
+    //   Input[0]  = 本合約 RoundShardAuthNFT（minting；gameOverFlag == 0x01）
+    //   Input[1]  = 本合約 ShardSettlementNFT（minting，同地址；gameOverFlag == 0x01）
+    //   Input[2+] = 觸發者 plain BCH（支付手續費）
+    //
+    //   Output[0] = RoundShardAuthNFT（原樣送回）
+    //   Output[1] = ShardSettlementNFT（原樣送回）
+    //   Output[2] = GameOverNFT（新鑄造，送回本合約地址，由 Input[0] 的 minting 能力授權）
+    //   Output[3] = 找零
+    // ─────────────────────────────────────────────────────────────
+    function mintGameOverNFT() {
+        require(this.activeInputIndex == 0, "RSA contract must always be at input index 0");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 23);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x01);
+        require(tx.inputs[0].nftCommitment.slice(22, 23) == 0x01, "RSA must have confirmed game over");
+        bytes8 rsaLastSoldTimeB = tx.inputs[0].nftCommitment.slice(14, 22);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 31);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x09);
+        require(tx.inputs[1].nftCommitment.slice(30, 31) == 0x01, "SS must have confirmed game over");
+
+        // Output[0]/[1]: 原樣送回，本函式純粹讀取驗證，不消費、不改變任何既有狀態
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].nftCommitment == tx.inputs[0].nftCommitment);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        // Output[2]: GameOverNFT（9 bytes，none capability，確認時間 = Input[0] 的最後售出時間）
+        bytes gameOverC = 0x0b + rsaLastSoldTimeB;
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[2].tokenCategory == authNftCategoryId);
+        require(tx.outputs[2].nftCommitment == gameOverC);
+        require(tx.outputs[2].value == 1000);
+
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].value >= 1000);
+
+        require(tx.outputs.length == 4, "Invalid number of outputs");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useForMintGameOver: mintGameOverNFT() 交易中解鎖本分片的 ShardSettlementNFT（Input[1]）
+    // 主要驗證在 mintGameOverNFT()（Input[0]，同一合約的另一個 UTXO），這裡僅做輕量驗證，
+    // 比照 useForSettle() 的既有慣例。
+    // ─────────────────────────────────────────────────────────────
+    function useForMintGameOver() {
+        require(this.activeInputIndex == 1, "SS contract must be at input index 1 during mintGameOverNFT()");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 23);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x01);
+        require(tx.inputs[0].nftCommitment.slice(22, 23) == 0x01, "RSA must have confirmed game over");
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 31);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x09);
+        require(tx.inputs[1].nftCommitment.slice(30, 31) == 0x01, "SS must have confirmed game over");
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useGameOverNFT: 供其他合約的函式把本分片鑄造的 GameOverNFT 當唯讀輸入引用時解鎖。
+    // 邏輯：
+    // - 純粹讀取格式驗證＋原樣送回，不做任何業務邏輯。
+    // - GameOverNFT 固定在 Input[1]。
+    //
+    // 交易結構：
+    //   Input[0]  = adminNftCategoryId NFT（admin 持有，P2PKH，簽名解鎖）
+    //   Input[1]  = GameOverNFT（任一分片地址，唯讀，透過 RoundShardAuth.useGameOverNFT() 解鎖）
+    //
+    //   Output[0]  = adminNftCategoryId NFT（原樣送回 admin）
+    //   Output[1]  = GameOverNFT（原樣送回）
+    // ─────────────────────────────────────────────────────────────
+    function useGameOverNFT() {
+        require(this.activeInputIndex == 1, "GameOverNFT must be at input index 1");
+
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useForSweepAccumulating: 供 JackpotPool.sweepAccumulatingAfterGameOver()
+    // 的 permissionless 交易引用 GameOverNFT 時解鎖，不需要 admin NFT。
+    // GameOverNFT 固定在 Input[1]，passthrough Output 固定在 Output[0]
+    // （因 Input[0] 的 JackpotPoolNFT 被銷毀，後面的輸出全部往前遞補一位）。
+    // ─────────────────────────────────────────────────────────────
+    function useForSweepAccumulating() {
+        require(this.activeInputIndex == 1, "GameOverNFT must be at input index 1");
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 27);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x0a);
+        require(tx.inputs[0].nftCommitment.slice(9, 10) == 0x00, "Only accumulating (winnerCount == 0) pools can be swept here");
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        require(tx.inputs[2].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[2].nftCommitment.slice(0, 1) == 0x03);
+        require(tx.inputs[2].nftCommitment.length == 30);
+
+        require(tx.outputs[0].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[0].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // endGame:
+    // GameOverNFT 產生後，表示遊戲已結束，系統進入 end-game 模式。
+    // 驗證邏輯只證明「遊戲確實已結束」與「操作者確實是 admin」，
+    // 合約只檢查adminNftCategoryId與gameOverNftCategoryId 原樣輸入與輸出。
+    // 其他完全交由 admin 決定。
+    //
+    // 交易結構：
+    //   Input[0]  = adminNftCategoryId NFT（admin 持有，P2PKH，簽名解鎖）
+    //   Input[1]  = GameOverNFT（任一分片地址，唯讀，透過 RoundShardAuth.useGameOverNFT() 解鎖）
+    //
+    //   Output[0]  = adminNftCategoryId NFT（原樣送回 admin）
+    //   Output[1]  = GameOverNFT（原樣送回）
+    // ─────────────────────────────────────────────────────────────
+    function endGame() {
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+}

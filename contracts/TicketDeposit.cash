@@ -1,0 +1,151 @@
+pragma cashscript ^0.13.1;
+
+// TicketDeposit — lets consumers without a connected wallet buy tickets too
+//
+// Consumers deposit BCH to this contract's address, and the platform executes the
+// ticket-purchase transaction on their behalf. The TicketNFT is minted directly to the
+// consumer's P2PKH address (buyerPkh), with no two-stage handoff needed.
+//
+// The constructor parameters alone determine the contract address:
+//   authNftCategoryId:    the system's token category ID
+//   sha256LotteryNumbers: sha256 commitment of the number combination being purchased (32 bytes)
+//                         preimage = round (LE, 2 bytes) + N number sets (4 bytes each:
+//                         [n1, n2, n3, s], 1 byte each), N = 1..10;
+//                         the actual preimage is supplied as a function argument when
+//                         buyTicket() is called — the contract only stores its sha256 hash,
+//                         so the constructor parameters (redeem script) don't grow linearly
+//                         with the number of number sets
+//   buyerPkh:             the consumer's P2PKH address hash (20 bytes)
+//
+// TicketNFT commitment format (14 bytes, BE, with 0xff separators for readability):
+//   each NFT represents exactly 1 ticket (1 number set)
+//   [0-1]  round:        BE uint16
+//   [2]    0xff (separator)
+//   [3-6]  lotteryNumber:[n1, n2, n3, s], 1 byte each
+//   [7]    0xff (separator)
+//   [8-11] purchaseRate: BE uint32
+//   [12]   0xff (separator)
+//   [13]   claimStatus:  0x00 (unclaimed)
+
+contract TicketDeposit(
+    bytes32 authNftCategoryId,
+    bytes32 sha256LotteryNumbers,
+    bytes20 buyerPkh,
+    bytes32 adminNftCategoryId
+) {
+
+    // ─────────────────────────────────────────────────────────────
+    // buyTicket: executes the ticket purchase (multiple number sets can be bought at once)
+    //
+    // Takes no arguments — the preimage is reconstructed from this transaction: round (LE, 2 bytes,
+    // taken from tx.inputs[0]'s RSA commitment) + N number sets (4 bytes each, taken in order from
+    // tx.inputs[1..N]'s NumberSalesNFT commitments), and must satisfy
+    // sha256(preimage) == sha256LotteryNumbers
+    //
+    // Let N = tx.inputs.length - 2 (the number of tickets purchased, N = 1..10)
+    //
+    // Transaction structure (same tx shape as RoundShardAuthNFT.sellTicket, with this contract's
+    // UTXO standing in for the player's plain BCH):
+    //   Input[0]      = RoundShardAuthNFT (minting)
+    //   Input[1..N]   = NumberSalesNFT × N (mutable, in order matching each number set in lotteryNumbers)
+    //   Input[N+1]    = this contract's UTXO (holding the ticket-purchase BCH)
+    //
+    //   Output[0]       = RSA NFT (updated, verified by the RSA contract)
+    //   Output[1..N]    = NumberSalesNFT × N (odd/even sales counts updated, verified by the NS contract)
+    //   Output[N+1..2N] = TicketNFT × N (newly minted, sent directly to buyerPkh)
+    //   Output[2N+1]    = BCH change (mandatory; tx.outputs.length is fixed at 2N+2)
+    // ─────────────────────────────────────────────────────────────
+    function buyTicket() {
+        int ticketQuantity = tx.inputs.length - 2;
+        require(ticketQuantity >= 1 && ticketQuantity <= 10, "Invalid ticket quantity");
+
+        // Verify input[0] is the RSA NFT (minting capability, 23 bytes)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 23);
+
+        bytes1 rsaPurposeByte, bytes rsaR1 = tx.inputs[0].nftCommitment.split(1);
+        bytes2 roundBytes = rsaR1.split(2)[0];
+
+        require(rsaPurposeByte == 0x01);
+
+        bytes25 buyerLock = 0x76a914 + buyerPkh + 0x88ac;
+        bytes preimage = roundBytes;
+
+        // The full commitments and amount calculations for RSA / NumberSalesNFT / TicketNFT are
+        // already fully verified by RoundShardAuth.sellTicket() (Input[0], the primary verifying
+        // contract for this transaction) and each NumberSales.sellTicket() (Input[1..N]); this
+        // contract only needs to confirm: (1) the purchase content (round + numbers) matches the
+        // order the consumer locked in at deposit time, and (2) the TicketNFT/change both go to
+        // the consumer's address
+        for (int i = 1; i <= ticketQuantity; i++) {
+            // Sequentially split-parse the NumberSalesNFT commitment (17 bytes)
+            bytes1 nsPurposeByte, bytes nsR1 = tx.inputs[i].nftCommitment.split(1);
+            bytes4 lotteryNumB = nsR1.split(4)[0];
+            preimage = preimage + lotteryNumB;
+
+            // Verify input[1..N] is a NumberSalesNFT (mutable capability)
+            require(tx.inputs[i].tokenCategory == authNftCategoryId + 0x01);
+            require(tx.inputs[i].nftCommitment.length == 17);
+            require(nsPurposeByte == 0x02);
+
+            // ── Output[N+1..2N]: TicketNFT (commitment fully verified by the RSA contract, only the destination is checked here) ──
+            int k = ticketQuantity + i;
+            require(tx.outputs[k].tokenCategory == authNftCategoryId); // immutable
+            require(tx.outputs[k].nftCommitment.length == 14);
+            require(tx.outputs[k].lockingBytecode == buyerLock);
+        }
+
+        require(sha256LotteryNumbers == sha256(preimage));
+
+        //   Output[2N+1] = BCH change (mandatory; tx.outputs.length is fixed at 2N+2)
+        int changeIdx = ticketQuantity * 2 + 1;
+        require(tx.outputs[changeIdx].lockingBytecode == buyerLock, "Invalid BCH change output - should send change to original player");
+        require(tx.outputs[changeIdx].value >= 1000, "Invalid BCH change output - should have at least 1000 satoshis");
+        require(tx.outputs[changeIdx].tokenCategory == 0x, "Invalid BCH change output - should not hold any tokens");
+
+        require(tx.outputs.length == (changeIdx + 1), "Invalid number of outputs - should have equal amount of outputs as ticket quantity *2 + 2");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // refund: refunds to the consumer's address (no signature required, callable by anyone)
+    //
+    // Purpose: when a ticket purchase doesn't complete, return the BCH (or any already-minted
+    // TicketNFT) to the consumer's address
+    // Constraint: Output[0] must be sent to buyerPkh
+    // ─────────────────────────────────────────────────────────────
+    function refund() {
+        bytes25 buyerLock = 0x76a914 + buyerPkh + 0x88ac;
+        require(tx.outputs[0].lockingBytecode == buyerLock);
+        require(tx.outputs.length == 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // endGame:
+    // Once a GameOverNFT exists, it signals the game has ended and the system enters end-game
+    // mode. The verification logic here only proves "the game has genuinely ended" and "the
+    // caller is genuinely the admin" — the contract just checks that adminNftCategoryId and
+    // gameOverNftCategoryId pass through unchanged from input to output.
+    // Everything else is left entirely to the admin's discretion.
+    //
+    // Transaction structure:
+    //   Input[0]  = adminNftCategoryId NFT (held by admin, P2PKH, unlocked by signature)
+    //   Input[1]  = GameOverNFT (any shard address, read-only, unlocked via RoundShardAuth.useGameOverNFT())
+    //
+    //   Output[0]  = adminNftCategoryId NFT (sent back to admin unchanged)
+    //   Output[1]  = GameOverNFT (sent back unchanged)
+    // ─────────────────────────────────────────────────────────────
+    function endGame() {
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+}

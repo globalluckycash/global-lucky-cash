@@ -1,0 +1,139 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  /* 固定保留垂直捲軸空間，避免頁面高度不足導致捲軸消失、
+     置中內容(mx-auto)因可用寬度變化而左右位移 */
+  scrollbar-gutter: stable;
+  /* 頁面只設計成上下捲動；任何子元素（例如 hover 提示框）意外超出視窗寬度時，
+     不應該讓整頁被拖出水平捲軸 */
+  overflow-x: hidden;
+}
+
+body {
+  background-color: #0F1115;
+  color: white;
+  /* 固定於視窗座標(不隨頁面內容高度縮放)，確保各頁亮度一致 */
+  background-image: radial-gradient(circle at 50% 0%, #051f18 0%, #0F1115 70%);
+  background-attachment: fixed;
+  font-family: 'Inter', sans-serif;
+  overflow-x: hidden;
+}
+
+.grid-bg {
+  background-size: 40px 40px;
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  mask-image: linear-gradient(to bottom, black 50%, transparent 100%);
+}
+
+.number-btn {
+  transition: all 0.2s ease;
+}
+
+.number-btn.selected {
+  background-color: #0AC18E !important;
+  color: #000 !important;
+  border-color: #00FFC2 !important;
+  box-shadow: 0 0 15px #0AC18E;
+  transform: scale(1.1);
+}
+
+.number-btn.special-selected {
+  background-color: #A855F7 !important;
+  color: #fff !important;
+  border-color: #D8B4FE !important;
+  box-shadow: 0 0 15px #A855F7;
+  transform: scale(1.1);
+}
+
+.number-btn.selected:hover,
+.number-btn.special-selected:hover {
+  box-shadow: 0 0 25px currentColor;
+  opacity: 1;
+}
+
+/* Toast animation */
+.toast-enter-active,
+.toast-leave-active {
+  transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+.toast-enter-from,
+.toast-leave-to {
+  transform: translateX(-50%) translateY(5rem);
+  opacity: 0;
+}
+.toast-enter-to,
+.toast-leave-from {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+}
+
+/* Modal overlay */
+.modal-overlay {
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+}
+
+/* Spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  animation: spin 1s linear infinite;
+}
+
+/* Pulse for live indicator */
+@keyframes pulse-bch {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Countdown monospace large text */
+.countdown-display {
+  font-family: 'Space Mono', monospace;
+  font-weight: 700;
+}
+
+/* Thin accent scrollbar for compact, height-capped lists (e.g. donation highlight) */
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(10, 193, 142, 0.35) transparent;
+}
+.thin-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(10, 193, 142, 0.35);
+  border-radius: 999px;
+}
+
+/* Neon number ball */
+.number-ball {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  font-family: 'Space Mono', monospace;
+}
+
+.number-ball-green {
+  background-color: #0AC18E;
+  color: #000;
+  box-shadow: 0 0 8px rgba(10, 193, 142, 0.5);
+}
+
+.number-ball-purple {
+  background-color: #A855F7;
+  color: #fff;
+  box-shadow: 0 0 8px rgba(168, 85, 247, 0.5);
+}

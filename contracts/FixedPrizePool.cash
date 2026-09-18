@@ -1,0 +1,565 @@
+pragma cashscript ^0.13.1;
+
+// FixedPrizePool — fixed prize pool, holds 30% of ticket revenue per round
+// Funds are held at this contract's address as multiple plain UTXOs (no NFT), pooled together
+//
+// This contract handles fixed-prize claims (claimFixedPrize), canceled-round refunds
+// (claimCanceledRoundRefund), and admin withdrawal (adminWithdraw)
+
+contract FixedPrizePool(bytes32 authNftCategoryId, bytes32 adminNftCategoryId, int ticketPriceCents) {
+
+    // ─────────────────────────────────────────────────────────────
+    // claimFixedPrize: fixed-prize claim transaction (FPP side)
+    //
+    // Transaction layout (Input[1..n] / Output[3] = this contract):
+    //   Input[0]  = TicketNFT (held by player, P2PKH, capability none; burned)
+    //   Input[1]  = WinningNumberNFT (FPP address, capability minting, permanently retained; verification anchor)
+    //   Input[2+] = Fixed prize pool plain BCH funding UTXOs (this contract's address, each unlocked via
+    //               spendPlainBCH(); these UTXOs may be very small so there could be a large number of them,
+    //               no upper limit; their sum must cover the prize and the fee)
+    //
+    //   Output[0] = TicketNFT (newly minted, claimStatus = winning-tier code 02-05, other fields unchanged; sent back to player)
+    //   Output[1] = WinningNumberNFT (FPP address, unchanged)
+    //   Output[2] = Prize BCH -> player
+    //   Output[3] = Fixed prize pool plain BCH change (= sum of all funding UTXOs -= prize -= fee)
+    // ─────────────────────────────────────────────────────────────
+    function claimFixedPrize() {
+        require(this.activeInputIndex == 1, "Fixed prize pool contract must always be at input index 1");
+
+        // Parse WN commitment
+        bytes1 wnPurposeByte,  bytes wnR1 = tx.inputs[1].nftCommitment.split(1);
+        bytes2 wnRoundBytes,   bytes wnR2 = wnR1.split(2);
+        bytes1 wn1B,           bytes wnR3 = wnR2.split(1);
+        bytes1 wn2B,           bytes wnR4 = wnR3.split(1);
+        bytes1 wn3B,           bytes wnR5 = wnR4.split(1);
+        bytes1 wsB = wnR5.split(1)[0];
+
+        // Verify input[1] is the WN NFT (FPP side, purpose 0x05, minting capability)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(wnPurposeByte == 0x05);
+        require(tx.inputs[1].nftCommitment.length == 16);
+
+        // Verify input[2..] are all fixed prize pool plain BCH funding UTXOs (no NFT, locked to this
+        // contract's address, each unlocking verified by spendPlainBCH()), and sum up their amounts
+        int fundingCount = tx.inputs.length - 2;
+        require(fundingCount >= 1, "Invalid funding UTXO count");
+        int totalFunding = 0;
+        for (int i = 2; i < tx.inputs.length; i++) {
+            require(tx.inputs[i].tokenCategory == 0x);
+            require(tx.inputs[i].lockingBytecode == tx.inputs[1].lockingBytecode);
+            totalFunding = totalFunding + tx.inputs[i].value;
+        }
+
+        // Verify input[0] is the TicketNFT (none capability)
+        require(tx.inputs[0].tokenCategory == authNftCategoryId);
+        require(tx.inputs[0].nftCommitment.length == 14);
+
+        // Parse TicketNFT commitment (14 bytes, BE, with 0xff separators)
+        // [0-1]=round BE, [2]=ff, [3-6]=numbers, [7]=ff, [8-11]=rate BE, [12]=ff, [13]=claimStatus
+        bytes3 tRoundBEWithFfB, bytes tR1 = tx.inputs[0].nftCommitment.split(3);
+        bytes1 tn1B,            bytes tR2 = tR1.split(1);
+        bytes1 tn2B,            bytes tR3 = tR2.split(1);
+        bytes1 tn3B,            bytes tR4 = tR3.split(1);
+        bytes1 tsB,             bytes tR5 = tR4.split(1);
+        bytes4 tPurchaseRateBE = tR5.slice(1,5);
+        bytes1 tClaimStatusB = tR5.slice(6,7);
+
+
+        // Convert round from LE to BE, then compare against the ticket's round (BEWithFf)
+        bytes1 wnRoundL, bytes wnRoundH = wnRoundBytes.split(1);
+        require(tRoundBEWithFfB == unsafe_bytes1(wnRoundH) + wnRoundL + 0xff);
+        // Verify the fixed prize has not already been claimed (only check the low nibble; the high
+        // nibble's cancellation-refund / jackpot-share-refund flags are unaffected)
+        require((tClaimStatusB & 0x0f) == 0x00);
+
+        // Convert purchase rate from BE to LE, then use int()
+        bytes1 tRateH1, bytes rateR1 = tPurchaseRateBE.split(1);
+        bytes1 tRateH2, bytes rateR2 = rateR1.split(1);
+        bytes1 tRateH3, bytes tRateH4 = rateR2.split(1);
+
+        int purchaseRate = int(unsafe_bytes1(tRateH4)
+                         + tRateH3
+                         + tRateH2
+                         + tRateH1);
+        require(purchaseRate > 0);
+
+        // Count normal-number matches
+        int nm1 = 0; if (tn1B == wn1B || tn1B == wn2B || tn1B == wn3B) { nm1 = 1; }
+        int nm2 = 0; if (tn2B == wn1B || tn2B == wn2B || tn2B == wn3B) { nm2 = 1; }
+        int nm3 = 0; if (tn3B == wn1B || tn3B == wn2B || tn3B == wn3B) { nm3 = 1; }
+        int normalMatch  = nm1 + nm2 + nm3;
+        bool specialMatch = (tsB == wsB);
+
+        // Determine the prize tier (multiplier) and the corresponding claimStatus low-nibble winning-tier code
+        // Codes match the frontend display order: 01=jackpot (JackpotPool.claimJackpot()) / 02=1st prize / 03=2nd prize / 04=3rd prize / 05=4th prize
+        int prizeMultiplier = 0;
+        int tier = 0;
+        if (normalMatch == 3 && !specialMatch) {
+            prizeMultiplier = 100; // 1st prize: 3 normal numbers (excluding special number)
+            tier = 2;
+        } else if (normalMatch == 2 && specialMatch) {
+            prizeMultiplier = 20;  // 2nd prize: 2 normal numbers + 1 special number
+            tier = 3;
+        } else if (normalMatch == 1 && specialMatch) {
+            prizeMultiplier = 5;   // 3rd prize: 1 normal number + 1 special number
+            tier = 4;
+        } else if (normalMatch == 0 && specialMatch) {
+            prizeMultiplier = 2;   // 4th prize: 1 special number (no normal numbers)
+            tier = 5;
+        }
+        require(prizeMultiplier > 0); // Must match at least one prize tier
+
+        // Compute total prize amount (sats) — each TicketNFT is fixed at 1 ticket; purchaseRate is
+        // scaled up 100x (ATTESTATION_SCALING) and must be reversed accordingly
+        int totalPrizeSats = prizeMultiplier * ticketPriceCents * 100_000_000 / purchaseRate;
+
+        // Output[0]: newly minted TicketNFT (claimStatus only rewrites the low nibble to the winning
+        // tier code; the high nibble's original value is unchanged)
+        // The original TicketNFT (none) has been burned (does not appear in outputs); minting is
+        // authorized by this round's WN NFT minting capability
+        bytes1 tierB = toPaddedBytes(tier, 1);
+        bytes1 newClaimStatusB = (tClaimStatusB & 0xf0) | tierB;
+        bytes newTicketC = tx.inputs[0].nftCommitment.split(13)[0] + newClaimStatusB;
+        require(tx.outputs[0].nftCommitment == newTicketC);
+        require(tx.outputs[0].tokenCategory == authNftCategoryId); // none capability
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode); // ensure the new TicketNFT is sent back to the player
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        // Output[1]: WinningNumberNFT sent back unchanged to this contract (FPP address, minting capability retained)
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        // Output[2]: prize paid to player
+        require(tx.outputs[2].value == totalPrizeSats);
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode); // ensure the prize is paid to the player
+
+        // Output[3]: fixed prize pool plain BCH change (= sum of all funding UTXOs -= prize -= fee)
+        // maxFee scales linearly with the number of funding UTXOs (each P2SH input must carry the full redeem script)
+        int maxFee = 2000 + 2200 * fundingCount;
+        require(tx.outputs[3].value >= totalFunding - totalPrizeSats - maxFee);
+        require(tx.outputs[3].value <= totalFunding - totalPrizeSats);
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode); // ensure the fixed prize pool change is sent back to this contract
+
+        require(tx.outputs.length == 4);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // spendPlainBCH: plain BCH spending
+    //
+    // Transaction layout (Input[1..n] / Output[] = this contract):
+    //   Input[0]  = TicketNFT (held by player, P2PKH, capability none; burned)
+    //   Input[1]  = WinningNumberNFT (FPP address, capability minting, permanently retained; verification anchor)
+    //   Input[2+] = Fixed prize pool plain BCH funding UTXOs (this contract's address, each unlocked via
+    //               spendPlainBCH(); these UTXOs may be very small so there could be a large number of them,
+    //               no upper limit; their sum must cover the prize and the fee)
+    //
+    //   Output[0] = TicketNFT (newly minted, claimStatus = winning-tier code 02-05, other fields unchanged; sent back to player)
+    //   Output[1] = WinningNumberNFT (FPP address, unchanged)
+    //   Output[2] = Prize BCH -> player
+    //   Output[3] = Fixed prize pool plain BCH change (= sum of all funding UTXOs -= prize -= fee)
+    // ─────────────────────────────────────────────────────────────
+    function spendPlainBCH() {
+        int myIndex = this.activeInputIndex;
+        require(tx.inputs[myIndex].tokenCategory == 0x);
+        require(tx.inputs[myIndex].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId);
+        require(tx.inputs[0].nftCommitment.split(13)[1] == 0x00);
+        require(tx.inputs[0].nftCommitment.length == 14);
+
+        // Verify input[1] is the WN NFT (FPP side, purpose 0x05, minting capability)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x05);
+        require(tx.inputs[1].nftCommitment.length == 16);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].nftCommitment.split(13)[1] != 0x00);
+        require(tx.outputs[0].nftCommitment.length == 14);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        // Verify output[1] is the WN NFT (FPP side, sent back unchanged to this contract)
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[2].value >= 1000);
+
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode); // ensure the fixed prize pool change is sent back to this contract
+        require(tx.outputs[3].value >= 1000);
+
+        require(tx.outputs.length == 4);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // claimCanceledRoundRefund: canceled-round refund transaction (FPP side)
+    //
+    // Transaction layout (Input[1..n] / Output[3] = this contract):
+    //   Input[0]  = TicketNFT (held by player, P2PKH, capability none; burned)
+    //   Input[1]  = CanceledRoundNFT (FPP address, capability minting, permanently retained; verification anchor)
+    //   Input[2+] = Fixed prize pool plain BCH funding UTXOs (this contract's address, each unlocked via
+    //               spendPlainBCHForRefund(); their sum must cover the refund amount and the fee)
+    //
+    //   Output[0] = TicketNFT (newly minted, claimStatus=10, other fields unchanged; sent back to player)
+    //   Output[1] = CanceledRoundNFT (FPP address, sent back unchanged)
+    //   Output[2] = Refund amount BCH -> player
+    //   Output[3] = Fixed prize pool plain BCH change (= sum of all funding UTXOs -= refund amount -= fee)
+    // ─────────────────────────────────────────────────────────────
+    function claimCanceledRoundRefund() {
+        require(this.activeInputIndex == 1, "Fixed prize pool contract must always be at input index 1");
+
+        // Parse CanceledRoundNFT commitment (12 bytes, little-endian)
+        // [0]=purpose, [1-2]=round(LE), [3-7]=cumulativeSales, [8-11]=saleRate
+        bytes1 crPurposeB = tx.inputs[1].nftCommitment.slice(0, 1);
+        bytes2 crRoundB = tx.inputs[1].nftCommitment.slice(1, 3);
+
+        // Verify input[1] is the CanceledRoundNFT (FPP side, purpose 0x07, minting capability)
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(crPurposeB == 0x07);
+        require(tx.inputs[1].nftCommitment.length == 12);
+
+        // Verify input[2..] are all fixed prize pool plain BCH funding UTXOs (same as claimFixedPrize())
+        int fundingCount = tx.inputs.length - 2;
+        require(fundingCount >= 1, "Invalid funding UTXO count");
+        int totalFunding = 0;
+        for (int i = 2; i < tx.inputs.length; i++) {
+            require(tx.inputs[i].tokenCategory == 0x);
+            require(tx.inputs[i].lockingBytecode == tx.inputs[1].lockingBytecode);
+            totalFunding = totalFunding + tx.inputs[i].value;
+        }
+
+        // 驗證 input[0] 為 TicketNFT（none capability）
+        require(tx.inputs[0].tokenCategory == authNftCategoryId);
+        require(tx.inputs[0].nftCommitment.length == 14);
+
+        // 解析 TicketNFT commitment（14 bytes，BE，含 ff 分隔）
+        // [0-1]=round BE, [2]=ff, [3-6]=numbers, [7]=ff, [8-11]=rate BE, [12]=ff, [13]=claimStatus
+        bytes2 tRoundBEWithFfB = tx.inputs[0].nftCommitment.slice(0, 2);
+        bytes4 tPurchaseRateBE = tx.inputs[0].nftCommitment.slice(8, 12);
+        bytes1 tClaimStatusB   = tx.inputs[0].nftCommitment.slice(13, 14);
+
+        // 輪次 LE→BE 轉換後與 Ticket 輪次（BEWithFf）比對
+        bytes1 crRoundL, bytes crRoundH = crRoundB.split(1);
+        require(tRoundBEWithFfB == unsafe_bytes1(crRoundH) + crRoundL);
+        // 驗證尚未領獎／退款（防重複退款）
+        require(tClaimStatusB == 0x00);
+
+        // 售票匯率 BE→LE 轉換後使用 int() 運算（比照 claimFixedPrize()）
+        bytes1 tRateH1, bytes rateR1 = tPurchaseRateBE.split(1);
+        bytes1 tRateH2, bytes rateR2 = rateR1.split(1);
+        bytes1 tRateH3, bytes tRateH4 = rateR2.split(1);
+
+        int purchaseRate = int(unsafe_bytes1(tRateH4)
+                         + tRateH3
+                         + tRateH2
+                         + tRateH1);
+        require(purchaseRate > 0);
+
+        // 退款金額（sats）— 每張 TicketNFT 固定 1 票，依這張 TicketNFT 自己購買時的
+        // 售票匯率換算原始票價（不乘中獎倍數）；purchaseRate 已放大 100 倍
+        // （ATTESTATION_SCALING），需一併還原
+        int refundSats = ticketPriceCents * 100_000_000 / purchaseRate;
+
+        // Output[0]：新鑄造的 TicketNFT（claimStatus 寫為 0x10，最後 1 byte 改寫）
+        // 原 TicketNFT（none）已銷毀（不出現於輸出），由本輪 CanceledRoundNFT 的 minting 能力授權鑄造
+        bytes newTicketC = tx.inputs[0].nftCommitment.split(13)[0] + 0x10;
+        require(tx.outputs[0].nftCommitment == newTicketC);
+        require(tx.outputs[0].tokenCategory == authNftCategoryId); // none capability
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode); // 確保新 TicketNFT 發回玩家
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        // Output[1]：CanceledRoundNFT 原樣送回本合約（FPP 地址，minting capability 保持）
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        // Output[2]：退款金額給玩家
+        require(tx.outputs[2].value == refundSats);
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode); // 確保退款發給玩家
+
+        // Output[3]：固定獎池 plain BCH 找零（= 所有資金 UTXO 加總 -= 退款金額 -= 手續費）
+        // maxFee 公式與 claimFixedPrize() 相同（隨資金 UTXO 筆數線性放寬）
+        int maxFee = 2000 + 2200 * fundingCount;
+        require(tx.outputs[3].value >= totalFunding - refundSats - maxFee);
+        require(tx.outputs[3].value <= totalFunding - refundSats);
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode); // 確保固定獎池找零發回本合約
+
+        require(tx.outputs.length == 4);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // spendPlainBCHForRefund: plain BCH spending，供取消輪次退款交易解鎖
+    // 主要的邏輯在 spendCanceledRoundRefund 裡面，
+    //
+    // 交易結構（Input[2..n] / Output[3] = 本合約）：
+    //   Input[0]  = TicketNFT（玩家持有，P2PKH，capability none；銷毀）
+    //   Input[1]  = CanceledRoundNFT（FPP 地址，capability minting，永久保留；驗證主體）
+    //   Input[2+] = 固定獎池 plain BCH 資金 UTXO（本合約地址，各自透過
+    //               spendPlainBCHForRefund() 解鎖，加總須支付退款金額及手續費）
+    //
+    //   Output[0] = TicketNFT（新鑄造，claimStatus=10，其餘欄位不變；送回玩家）
+    //   Output[1] = CanceledRoundNFT（FPP 地址，原樣送回）
+    //   Output[2] = 退款金額 BCH → 玩家
+    //   Output[3] = 固定獎池 plain BCH 找零（= 所有資金 UTXO 加總 -= 退款金額 -= 手續費）
+    // ─────────────────────────────────────────────────────────────
+    function spendPlainBCHForRefund() {
+        int myIndex = this.activeInputIndex;
+        require(tx.inputs[myIndex].tokenCategory == 0x);
+        require(tx.inputs[myIndex].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId);
+        require(tx.inputs[0].nftCommitment.split(13)[1] == 0x00);
+        require(tx.inputs[0].nftCommitment.length == 14);
+
+        // 驗證 input[1] 為 CanceledRoundNFT（FPP 端，purpose 0x07，minting capability）
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.split(1)[0] == 0x07);
+        require(tx.inputs[1].nftCommitment.length == 12);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].nftCommitment.split(13)[1] != 0x00);
+        require(tx.outputs[0].nftCommitment.length == 14);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        // 驗證 output[1] 為 CanceledRoundNFT（原樣送回本合約）
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        require(tx.outputs[2].tokenCategory == 0x);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[2].value >= 1000);
+
+        require(tx.outputs[3].value >= 1000);
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[1].lockingBytecode); // 確保固定獎池找零發回本合約
+
+        require(tx.outputs.length == 4);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // useForDeclareGameOver: declareGameOver() 交易中解鎖本合約地址上的 CanceledRoundNFT
+    // （Input[1..4] 之一）。輕量伴隨函式，主要驗證在
+    // RoundSwitchControl.declareGameOver()，這裡只驗證基本格式並要求原樣送回，不重複驗證
+    // 輪次遞增邏輯。
+    // ─────────────────────────────────────────────────────────────
+    function useForDeclareGameOver() {
+        require(tx.inputs[0].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[0].nftCommitment.length == 30);
+        require(tx.inputs[0].nftCommitment.slice(0, 1) == 0x03);
+        require(tx.inputs[0].nftCommitment.slice(28, 29) == 0x00, "Game already declared over");
+
+        int myIdx = this.activeInputIndex;
+        require(myIdx >= 1 && myIdx <= 4, "CanceledRoundNFT must be at input index 1-4 during declareGameOver()");
+
+        require(tx.inputs[myIdx].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[myIdx].nftCommitment.slice(0, 1) == 0x07);
+        require(tx.inputs[myIdx].nftCommitment.length == 12);
+
+        require(tx.outputs[myIdx].lockingBytecode == tx.inputs[myIdx].lockingBytecode);
+        require(tx.outputs[myIdx].tokenCategory == tx.inputs[myIdx].tokenCategory);
+        require(tx.outputs[myIdx].nftCommitment == tx.inputs[myIdx].nftCommitment);
+        require(tx.outputs[myIdx].value == tx.inputs[myIdx].value);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // claimJackpotShareRefund: 頭獎份額退款交易。前提是本合約地址上
+    // 存在一張正確的 JackpotClaimRangeNFT（由 JackpotPool.sweepAccumulatingAfterGameOver()
+    // 完整驗證鑄造，jackpotFrom/jackpotTo 保證正確），本函式可以直接信任其內容。
+    //
+    // 交易結構（Input[1] / Output[3] = 本合約）：
+    //   Input[0]  = TicketNFT（玩家持有，P2PKH，capability none；銷毀）
+    //   Input[1]  = WinningNumberNFT（本合約地址，capability minting，永久保留）
+    //   Input[2]  = JackpotClaimRangeNFT（本合約地址，capability none，永久保留）
+    //   Input[3+] = 固定獎池 plain BCH 資金 UTXO（各自透過 spendPlainBCHForJackpotShareRefund() 解鎖）
+    //
+    //   Output[0] = TicketNFT（新鑄造，領獎狀態 |= 0x20，低 nibble 原值不動；送回玩家）
+    //   Output[1] = WinningNumberNFT（原樣送回）
+    //   Output[2] = JackpotClaimRangeNFT（原樣送回）
+    //   Output[3] = 退款金額 → 玩家
+    //   Output[4] = 固定獎池 plain BCH 找零
+    // ─────────────────────────────────────────────────────────────
+    function claimJackpotShareRefund() {
+        require(this.activeInputIndex == 1, "Fixed prize pool contract must always be at input index 1");
+
+        // 解析 WinningNumberNFT commitment（16 bytes）
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 16);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x05);
+        bytes2 wnDrawRoundB = tx.inputs[1].nftCommitment.slice(1, 3);
+        bytes5 wnCumulativeSalesB = tx.inputs[1].nftCommitment.slice(7, 12);
+        bytes4 wnSaleRateB = tx.inputs[1].nftCommitment.slice(12, 16);
+
+        // 解析 JackpotClaimRangeNFT commitment（5 bytes）
+        require(tx.inputs[2].tokenCategory == authNftCategoryId);
+        require(tx.inputs[2].nftCommitment.length == 5);
+        require(tx.inputs[2].nftCommitment.slice(0, 1) == 0x0c);
+        bytes2 jackpotFromB = tx.inputs[2].nftCommitment.slice(1, 3);
+        bytes2 jackpotToB = tx.inputs[2].nftCommitment.slice(3, 5);
+
+        // 驗證 input[3..] 皆為固定獎池的 plain BCH 資金 UTXO（比照 claimFixedPrize()／
+        // claimCanceledRoundRefund() 既有模式）
+        int fundingCount = tx.inputs.length - 3;
+        require(fundingCount >= 1, "Invalid funding UTXO count");
+        int totalFunding = 0;
+        for (int i = 3; i < tx.inputs.length; i++) {
+            require(tx.inputs[i].tokenCategory == 0x);
+            require(tx.inputs[i].lockingBytecode == tx.inputs[1].lockingBytecode);
+            totalFunding = totalFunding + tx.inputs[i].value;
+        }
+
+        // 驗證 input[0] 為 TicketNFT（none capability）
+        require(tx.inputs[0].tokenCategory == authNftCategoryId);
+        require(tx.inputs[0].nftCommitment.length == 14);
+
+        bytes2 tRoundBEB = tx.inputs[0].nftCommitment.slice(0, 2);
+        bytes1 tClaimStatusB = tx.inputs[0].nftCommitment.slice(13, 14);
+
+        // 輪次 BE→LE 轉換後須與 WinningNumberNFT 的 drawRound 相符
+        bytes1 tRoundH, bytes tRoundL = tRoundBEB.split(1);
+        bytes2 tRoundLEB = unsafe_bytes1(tRoundL) + tRoundH;
+        require(tRoundLEB == wnDrawRoundB, "Ticket round must match WinningNumberNFT drawRound");
+
+        // 這張票的輪次須落在合法退款範圍內（jackpotFrom/jackpotTo 由合約驗證鑄造，可直接信任）
+        int ticketRound = int(tRoundLEB);
+        require(ticketRound >= int(jackpotFromB) && ticketRound <= int(jackpotToB), "Ticket round out of jackpot claim range");
+
+        // 防重複領取（bit5）
+        require((tClaimStatusB & 0x20) == 0x00, "Jackpot share refund already claimed");
+
+        // 金額計算：沿用 Drawing.cancelDraw() 計算 jpRefundWanted 的同一套公式，再除以該輪票數
+        int ticketPriceSats = ticketPriceCents * 100_000_000 / int(wnSaleRateB);
+        int roundRevenue = ticketPriceSats * int(wnCumulativeSalesB);
+        int jackpotShare = roundRevenue - roundRevenue * 20 / 100 - roundRevenue * 30 / 100;
+        int refundPerTicket = jackpotShare / int(wnCumulativeSalesB);
+
+        // Output[0]：新鑄造的 TicketNFT，只設 bit5，低 nibble 的固定獎等級 enum 原值不動
+        bytes1 newClaimStatusB = tClaimStatusB | 0x20;
+        bytes newTicketC = tx.inputs[0].nftCommitment.split(13)[0] + newClaimStatusB;
+        require(tx.outputs[0].nftCommitment == newTicketC);
+        require(tx.outputs[0].tokenCategory == authNftCategoryId);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        // Output[1]：WinningNumberNFT 原樣送回
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        // Output[2]：JackpotClaimRangeNFT 原樣送回
+        require(tx.outputs[2].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[2].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[2].value == tx.inputs[2].value);
+
+        // Output[3]：退款金額給玩家（精確相等，非下限）
+        require(tx.outputs[3].value == refundPerTicket);
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        // Output[4]：固定獎池 plain BCH 找零（maxFee 公式與 claimFixedPrize() 相同）
+        int maxFee = 2000 + 2200 * fundingCount;
+        require(tx.outputs[4].value >= totalFunding - refundPerTicket - maxFee);
+        require(tx.outputs[4].value <= totalFunding - refundPerTicket);
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        require(tx.outputs.length == 5);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // spendPlainBCHForJackpotShareRefund: plain BCH spending，供頭獎份額退款交易解鎖
+    // （比照既有 spendPlainBCHForRefund() 模式）
+    // ─────────────────────────────────────────────────────────────
+    function spendPlainBCHForJackpotShareRefund() {
+        int myIndex = this.activeInputIndex;
+        require(tx.inputs[myIndex].tokenCategory == 0x);
+        require(tx.inputs[myIndex].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        require(tx.inputs[0].tokenCategory == authNftCategoryId);
+        require(tx.inputs[0].nftCommitment.length == 14);
+        require((tx.inputs[0].nftCommitment.slice(13, 14) & 0x20) == 0x00);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId + 0x02);
+        require(tx.inputs[1].nftCommitment.length == 16);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x05);
+
+        require(tx.inputs[2].tokenCategory == authNftCategoryId);
+        require(tx.inputs[2].nftCommitment.length == 5);
+        require(tx.inputs[2].nftCommitment.slice(0, 1) == 0x0c);
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require((tx.outputs[0].nftCommitment.slice(13, 14) & 0x20) != 0x00);
+        require(tx.outputs[0].nftCommitment.length == 14);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].value == tx.inputs[0].value);
+
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].value == tx.inputs[1].value);
+
+        require(tx.outputs[2].tokenCategory == tx.inputs[2].tokenCategory);
+        require(tx.outputs[2].nftCommitment == tx.inputs[2].nftCommitment);
+        require(tx.outputs[2].lockingBytecode == tx.inputs[2].lockingBytecode);
+        require(tx.outputs[2].value == tx.inputs[2].value);
+
+        require(tx.outputs[3].tokenCategory == 0x);
+        require(tx.outputs[3].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[3].value >= 1000);
+
+        require(tx.outputs[4].value >= 1000);
+        require(tx.outputs[4].tokenCategory == 0x);
+        require(tx.outputs[4].lockingBytecode == tx.inputs[1].lockingBytecode);
+
+        require(tx.outputs.length == 5);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // endGame:
+    // GameOverNFT 產生後，表示遊戲已結束，系統進入 end-game 模式。
+    // 驗證邏輯只證明「遊戲確實已結束」與「操作者確實是 admin」，
+    // FPP 會有獎金，所以要限制90天後才能執行 FPP 的 endGame
+    // 合約只檢查adminNftCategoryId與gameOverNftCategoryId 原樣輸入與輸出。
+    // 其他完全交由 admin 決定。
+    //
+    // 交易結構：
+    //   Input[0]  = adminNftCategoryId NFT（admin 持有，P2PKH，簽名解鎖）
+    //   Input[1]  = GameOverNFT（任一分片地址，唯讀，透過 RoundShardAuth.useGameOverNFT() 解鎖）
+    //
+    //   Output[0]  = adminNftCategoryId NFT（原樣送回 admin）
+    //   Output[1]  = GameOverNFT（原樣送回）
+    // ─────────────────────────────────────────────────────────────
+    function endGame() {
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+
+        require(tx.inputs[1].tokenCategory == authNftCategoryId);
+        require(tx.inputs[1].nftCommitment.length == 9);
+        require(tx.inputs[1].nftCommitment.slice(0, 1) == 0x0b);
+
+        bytes8 gameOverConfirmedTimeB = tx.inputs[1].nftCommitment.slice(1, 9);
+
+        require(tx.time >= int(gameOverConfirmedTimeB) + 90 days, "Must wait 3 months after game over confirmed");
+
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].tokenCategory == tx.inputs[1].tokenCategory);
+        require(tx.outputs[1].nftCommitment == tx.inputs[1].nftCommitment);
+    }
+}

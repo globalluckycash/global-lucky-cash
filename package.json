@@ -1,0 +1,24 @@
+{
+  "name": "global-lucky-cash",
+  "version": "1.0.0",
+  "description": "Global Lucky Cash — CashScript contracts and the Vue frontend SDK for a fully on-chain, non-custodial lottery on Bitcoin Cash.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": ["frontend"],
+  "scripts": {
+    "compile-drawing-nft": "cashc contracts/Drawing.cash -o artifacts/Drawing.json",
+    "compile-fixed-prize-pool-nft": "cashc contracts/FixedPrizePool.cash -o artifacts/FixedPrizePool.json",
+    "compile-jackpot-pool-nft": "cashc contracts/JackpotPool.cash -o artifacts/JackpotPool.json",
+    "compile-number-sales-nft": "cashc contracts/NumberSales.cash -o artifacts/NumberSales.json",
+    "compile-platform-pool-nft": "cashc contracts/PlatformPool.cash -o artifacts/PlatformPool.json",
+    "compile-round-shard-auth-nft": "cashc contracts/RoundShardAuth.cash -o artifacts/RoundShardAuth.json",
+    "compile-round-switch-control-nft": "cashc contracts/RoundSwitchControl.cash -o artifacts/RoundSwitchControl.json",
+    "compile-ticket-deposit-nft": "cashc contracts/TicketDeposit.cash -o artifacts/TicketDeposit.json",
+    "compile-all": "npm run compile-drawing-nft && npm run compile-fixed-prize-pool-nft && npm run compile-jackpot-pool-nft && npm run compile-number-sales-nft && npm run compile-platform-pool-nft && npm run compile-round-shard-auth-nft && npm run compile-round-switch-control-nft && npm run compile-ticket-deposit-nft",
+    "dev": "npm run dev --workspace frontend",
+    "build": "npm run build --workspace frontend"
+  },
+  "devDependencies": {
+    "cashc": "^0.13.1"
+  }
+}

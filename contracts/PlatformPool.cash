@@ -1,0 +1,15 @@
+pragma cashscript ^0.13.1;
+
+// PlatformPool — the platform revenue pool, holding 20% of each round's ticket sales
+// Funds sit at this contract's address as plain UTXOs (no NFT)
+//
+// This contract only handles admin withdrawal (adminWithdraw)
+
+contract PlatformPool(bytes32 authNftCategoryId, bytes32 adminNftCategoryId) {
+
+    // adminWithdraw: input[0] must carry an admin NFT of the given category to authorize withdrawal
+    function adminWithdraw() {
+        require(authNftCategoryId.length == 32);
+        require(tx.inputs[0].tokenCategory == adminNftCategoryId);
+    }
+}
