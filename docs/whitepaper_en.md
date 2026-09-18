@@ -172,7 +172,7 @@ In order, that decodes to: round 3, main numbers 1/2/3, Bonus Number 4, sale exc
 
 ### 8.1 Six Stages, All Publicly Triggerable
 
-![Six-stage state diagram: On Sale → Settling → Aggregating → Awaiting Draw → Drawn](/whitepaper/round-lifecycle-en.png)
+![Six-stage state diagram: On Sale → Settling → Aggregating → Awaiting Draw → Drawn](/whitepaper-assets/round-lifecycle-en.png)
 
 A new round's ticket sales can start the moment the "enter drawing phase" transaction completes and the round number increments — there's no need to wait for the previous round's drawing and prize claims to finish first. Sales, settlement, aggregation, drawing, verifying wins, and both jackpot and fixed-prize claims all overlap and run in parallel without blocking each other.
 
